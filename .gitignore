@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 训练数据、截图、中间产物（全部忽略）
+res/
+
+# 底模预训练权重（可从官网重新下载）
+yolov8n.pt
+yolov8s.pt
+yolov8m.pt
+yolov8l.pt
+yolov8x.pt
+
+# runs/ 目录：忽略训练过程文件，只保留 .pt 权重
+runs/**
+!runs/
+!runs/*/
+!runs/*/weights/
+!runs/*/weights/*.pt
