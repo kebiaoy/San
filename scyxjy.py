@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 import requests
 
 # ──────────────────────────────────────────────
@@ -999,7 +1001,11 @@ def testParseVideoReplay():
     from collections import Counter
 
     # 使用一个 KindID=150（红中断勾卡）的文件测试
-    TEST_FILE = "res/battleReplay/61263_20260618/09856202606180269801.video"
+
+    # 有报胡测试
+    #TEST_FILE = "res/battleReplay/61263_20260618/09856202606180204803.video"
+
+    TEST_FILE = "res/battleReplay/61263_20260618/09856202606180244201.video"
     replay = parseVideoReplay(TEST_FILE)
 
     print("=" * 60)
@@ -1038,12 +1044,18 @@ def testParseVideoReplay():
             cmd_label = d.get("_cmd", f"sub={p.sub_cmd}")
             # 按指令类型输出关键字段
             if p.sub_cmd == 100:  # 游戏开始
+                bao = d.get('bao_chair', 0xFFFF)
+                bao_str = "无" if bao == 0xFFFF else str(bao)
+                mask = d.get('action_mask') or []
+                mask_str = f"  报胡掩码={mask}" if mask else ""
                 print(f"  [{i:3d}] {cmd_label}  庄={d.get('banker_chair')}  "
                       f"鬼牌={d.get('magic_card')}  "
+                      f"首个报胡决策玩家={bao_str}{mask_str}  "
                       f"手牌={d.get('hand_cards')}")
             elif p.sub_cmd == 101:  # 出牌
+                trustee_str = "AI托管" if d.get('trustee_out') else "手动"
                 print(f"  [{i:3d}] {cmd_label}  chair={d.get('out_chair')}  "
-                      f"牌={d.get('card')}  托管={d.get('trustee_out')}")
+                      f"牌={d.get('card')}  [{trustee_str}]")
             elif p.sub_cmd == 102:  # 抓牌
                 print(f"  [{i:3d}] {cmd_label}  chair={d.get('current_chair')}  "
                       f"牌={d.get('card')}  可操作={d.get('action_mask')}")
@@ -1095,16 +1107,888 @@ def testParseVideoReplay():
                       f"chair={d.get('operater_chair')}←{d.get('provide_chair')}  "
                       f"fan={d.get('per_user_fan')}")
             elif p.sub_cmd == 115:  # 报胡提醒
-                print(f"  [{i:3d}] {cmd_label}  chair={d.get('current_chair')}  "
-                      f"牌={d.get('card')}  flag={d.get('bao_hu_flag')}")
+                # wCurrentUser=65535(INVALID_CHAIR) 表示本轮报胡环节已结束/无人需决策
+                # wLastUser = 刚刚做出报胡/不报胡决策的玩家
+                cur = d.get('current_chair', 0)
+                cur_str = "无(本轮结束)" if cur == 0xFFFF else str(cur)
+                last = d.get('last_chair', 0)
+                bao = "报胡✓" if d.get('bao_hu_flag') else "不报"
+                print(f"  [{i:3d}] {cmd_label}  "
+                      f"决策玩家={cur_str}  刚决策={last}({bao})  "
+                      f"牌={d.get('card')}")
             else:
                 print(f"  [{i:3d}] {cmd_label}  {d}")
 
     print("=" * 60)
 
 # ──────────────────────────────────────────────
+# 训练数据生成
+# ──────────────────────────────────────────────
+
+# 通道/牌型常量
+CHAN_TOTAL  = 220   # 通道数 0-219（Ch204 已删除，原 Ch205-220 下移为 Ch204-219）
+CARD_TYPES  = 19   # 19 种牌：9万 + 9条 + 红中
+
+# WIK 动作掩码（与游戏 CMD_Game.lua 一致）
+_WIK_BAO_HU  = 0x10
+_WIK_PENG    = 0x02
+_WIK_GANG    = 0x04
+_WIK_JIA_GANG = 0x08   # 加杠（对已有碰副露加一张变四张）
+
+# 无效椅子
+_INVALID_CHAIR = 0xFFFF
+
+# 河牌通道起始偏移（与 wiki 通道设计对齐）
+_SELF_FWD_CH   = 5    # 正序自家前 9 张：Ch  5-22  (9槽×2 = 18通道)
+_SELF_BWD_CH   = 23   # 倒序自家近28张：Ch 23-78  (28槽×2 = 56通道)
+_SELF_DECAY_CH = 79   # 自家时序衰减：   Ch 79-82  (4通道)
+_OPP_FWD_CH    = 83   # 正序对家前 9 张：Ch 83-100 (18通道)
+_OPP_BWD_CH    = 101  # 倒序对家近28张：Ch101-156 (56通道)
+_OPP_DECAY_CH  = 157  # 对家时序衰减：   Ch157-160 (4通道)
+
+# 牌名（索引 0-18）
+_CARD_TYPE_NAMES: list[str] = [
+    "1万","2万","3万","4万","5万","6万","7万","8万","9万",
+    "1条","2条","3条","4条","5条","6条","7条","8条","9条",
+    "红中",
+]
+
+
+def _card_to_idx(card: int) -> int:
+    """
+    将牌字节映射到 0-18 的索引（与 GameLogic.lua CARD_INDEX 对齐）。
+
+    编码规则（来自 GameLogic.lua INDEX_DATA）：
+      0x11-0x19 → 万1-9  → 索引 0-8
+      0x21-0x29 → 条1-9  → 索引 9-17
+      0x35      → 红中   → 索引 18
+    无效牌（0x00 / 0xFF）返回 -1。
+    """
+    if card in (0x00, 0xFF):
+        return -1
+    suit  = (card >> 4) & 0x0F
+    value = (card & 0x0F) - 1   # 0-based
+    if suit == 0x1:              # 万
+        return value
+    if suit == 0x2:              # 条
+        return 9 + value
+    if card == 0x35:             # 红中
+        return 18
+    return -1
+
+
+def _hand_to_ch0_3(hand: list[int]) -> np.ndarray:
+    """
+    将手牌字节列表转换为通道 0-3（形状 4×19）。
+
+    通道语义（与 Mortal 风格对齐）：
+      channels[k][i] = 1.0  当且仅当 牌类型 i 在手牌中至少有 (k+1) 张
+    """
+    out = np.zeros((4, CARD_TYPES), dtype=np.float32)
+    cnt = [0] * CARD_TYPES
+    for c in hand:
+        idx = _card_to_idx(c)
+        if 0 <= idx < CARD_TYPES:
+            cnt[idx] += 1
+    for i, n in enumerate(cnt):
+        for k in range(min(n, 4)):
+            out[k, i] = 1.0
+    return out
+
+
+def _one_hot_card(card: int) -> np.ndarray:
+    """牌字节 → 19 维 one-hot 向量（无效牌返回全零）。"""
+    v = np.zeros(CARD_TYPES, dtype=np.float32)
+    idx = _card_to_idx(card)
+    if 0 <= idx < CARD_TYPES:
+        v[idx] = 1.0
+    return v
+
+
+# 河牌条目类型：(gang_card, discard_card, taken)
+#   gang_card   : 本巡发生杠的牌字节（0 = 无杠）
+#   discard_card: 弃出的牌字节（用于 Ch1 和时序衰减，取原始值）
+#   taken       : True = 被对方碰/直杠走（Ch1 置全零）
+KawaEntry = tuple[int, int, bool]
+
+# 副露条目类型：(card_byte, num_cards, type_value)
+#   card_byte : 副露中牌的字节（全部同类型，取任意一张即可）
+#   num_cards : 3=碰，4=杠
+#   type_value: Ch4 广播值：碰=0.0, 直杠=0.33, 加杠=0.67, 暗杠=1.0
+MeldEntry = tuple[int, int, float]
+
+# 副露类型广播值（与 wiki Ch4 定义对齐）
+_MELD_PENG    = 0.0    # 碰
+_MELD_ZHIGANG = 0.33   # 直杠/刮风
+_MELD_JIAGANG = 0.67   # 加杠/面下杠
+_MELD_ANGANG  = 1.0    # 暗杠/下雨
+
+
+def _fill_kawa_channels(
+    channels: np.ndarray,
+    kawa: list[KawaEntry],
+    ch_fwd: int,
+    ch_bwd: int,
+    ch_decay: int,
+) -> None:
+    """
+    填充一个玩家的河牌三段通道（in-place 修改）。
+
+    正序段（ch_fwd 起，占 18 通道）：
+      从河牌开头取最多 9 张，每张占 2 通道：
+        Ch+0 = gang_card one-hot （本巡是否发生杠，及杠的是哪张牌）
+        Ch+1 = discard one-hot   （弃牌；被碰/直杠走则全0）
+
+    倒序段（ch_bwd 起，占 56 通道）：
+      从河牌末尾取最多 28 张，逆序（最新在前），每张占 2 通道：
+        同上
+
+    时序衰减段（ch_decay 起，占 4 通道）：
+      v = exp(-0.2 × 距当前的步数)
+      同种牌可多次打出，4 个通道对应"第1次/2次/3次/4次打出"。
+      被碰/直杠走的牌同样参与衰减。
+    """
+    _ZERO19 = np.zeros(CARD_TYPES, dtype=np.float32)
+
+    # ── 正序前 9 张 ────────────────────────────────────────────
+    for slot in range(min(9, len(kawa))):
+        gang_c, discard_c, taken = kawa[slot]
+        ch = ch_fwd + slot * 2
+        channels[ch]     = _one_hot_card(gang_c)
+        channels[ch + 1] = _ZERO19.copy() if taken else _one_hot_card(discard_c)
+
+    # ── 倒序最近 28 张 ─────────────────────────────────────────
+    recent = kawa[-28:]
+    for slot, (gang_c, discard_c, taken) in enumerate(reversed(recent)):
+        ch = ch_bwd + slot * 2
+        channels[ch]     = _one_hot_card(gang_c)
+        channels[ch + 1] = _ZERO19.copy() if taken else _one_hot_card(discard_c)
+
+    # ── 时序衰减 ───────────────────────────────────────────────
+    # 4个通道：同种牌第1/2/3/4次被打出各占一个通道
+    decay_rows = np.zeros((4, CARD_TYPES), dtype=np.float32)
+    occur = [0] * CARD_TYPES
+    for step, (_, discard_c, _) in enumerate(reversed(kawa)):
+        idx = _card_to_idx(discard_c)
+        if 0 <= idx < CARD_TYPES and occur[idx] < 4:
+            decay_rows[occur[idx], idx] = math.exp(-0.2 * step)
+            occur[idx] += 1
+    channels[ch_decay: ch_decay + 4] = decay_rows
+
+
+def _fill_meld_channels(
+    channels: np.ndarray,
+    melds: list[MeldEntry],
+    ch_start: int,
+) -> None:
+    """
+    填充副露通道（4组×5通道，共 20 通道，in-place 修改）。
+
+    每组占 5 个通道（ch_start + group*5）：
+      Ch+0 ~ Ch+3 : 每张牌的 19 维 one-hot（碰时 Ch+3 全零）
+      Ch+4        : 副露类型全广播（碰=0.0 / 直杠=0.33 / 加杠=0.67 / 暗杠=1.0）
+    """
+    for grp, (card, num_cards, type_val) in enumerate(melds[:4]):
+        base = ch_start + grp * 5
+        oh   = _one_hot_card(card)
+        for pos in range(min(num_cards, 4)):
+            channels[base + pos] = oh
+        channels[base + 4, :] = type_val
+
+
+def _std_shanten(cnt18: list[int], k: int) -> int:
+    """
+    标准形向听数（k 组合 + 1 将，不含万能牌）。
+
+    cnt18: 长度 18 的计数数组（索引 0-8 = 万1-万9，9-17 = 条1-条9）
+    k    : 还需凑成的组合数
+
+    返回：向听数（-1=胡，0=听，1..= 差n张）
+
+    算法：外层枚举将头位置，内层 DFS 最大化组合得分。
+
+    公式：shanten = 2*k - best_score
+    其中 best_score = 2*melds + min(partials, k-melds) [+ 1 若有将]
+
+    关键正确性：将头只从"2张同牌"提取，不允许顺子等张占据将头槽。
+    """
+    def _max_meld_score(c: list[int]) -> int:
+        """最大化：2*melds + min(partials, k - melds)，不含将头。"""
+        best_s = [0]
+
+        def dfs(i: int, m: int, q: int) -> None:
+            while i < 18 and c[i] == 0:
+                i += 1
+            if i >= 18:
+                sc = 2 * m + min(q, k - m)
+                if sc > best_s[0]:
+                    best_s[0] = sc
+                return
+
+            ci = c[i]
+
+            # (A) 刻子
+            if m < k and ci >= 3:
+                c[i] -= 3; dfs(i, m + 1, q); c[i] += 3
+
+            # (B) 顺子（同花色连续3张）
+            if m < k and i % 9 <= 6 and c[i] >= 1 and c[i+1] >= 1 and c[i+2] >= 1:
+                c[i] -= 1; c[i+1] -= 1; c[i+2] -= 1
+                dfs(i, m + 1, q)
+                c[i] += 1; c[i+1] += 1; c[i+2] += 1
+
+            # 等张候选：仅当组合槽未满时（不占将头槽）
+            if m + q < k:
+                # (D) 碰待（2同张→待刻）
+                if ci >= 2:
+                    c[i] -= 2; dfs(i, m, q + 1); c[i] += 2
+
+                # (E) 坎张（gap=1）
+                if i % 9 <= 7 and c[i+1] >= 1:
+                    c[i] -= 1; c[i+1] -= 1
+                    dfs(i, m, q + 1)
+                    c[i] += 1; c[i+1] += 1
+
+                # (F) 嵌张（gap=2）
+                if i % 9 <= 6 and c[i+2] >= 1:
+                    c[i] -= 1; c[i+2] -= 1
+                    dfs(i, m, q + 1)
+                    c[i] += 1; c[i+2] += 1
+
+            # (G) 孤立
+            c[i] -= 1; dfs(i, m, q); c[i] += 1
+
+        dfs(0, 0, 0)
+        return best_s[0]
+
+    # 无将：直接计算最大组合得分
+    best = 2 * k - _max_meld_score(cnt18[:])
+
+    # 枚举每个将头位置（必须是 2 张同牌）
+    for i in range(18):
+        if cnt18[i] >= 2:
+            cnt18[i] -= 2
+            score = _max_meld_score(cnt18[:]) + 1   # +1 = 将头贡献
+            cnt18[i] += 2
+            best = min(best, 2 * k - score)
+
+    return best
+
+
+def _shanten_std(hand: list[int]) -> int:
+    """
+    纯标准形向听数（标准形 + 预摸形，不含五対形）。
+
+    用于 Ch203-205 弃牌比较，确保 11 张手牌与弃牌后 10 张手牌
+    使用同一套标准形口径进行比较，避免五対形造成口径不一致。
+    """
+    cnt = [0] * 19
+    for c in hand:
+        idx = _card_to_idx(c)
+        if 0 <= idx <= 18:
+            cnt[idx] += 1
+
+    magic = cnt[18]
+    reg   = cnt[:18]
+    n     = sum(reg) + magic
+    best  = 8
+
+    if n >= 2 and (n - 2) % 3 == 0:
+        k = (n - 2) // 3
+        best = min(best, max(-1, _std_shanten(reg, k) - magic))
+
+    if n >= 4 and (n - 1) % 3 == 0:
+        k_pre = (n - 1) // 3
+        best = min(best, max(-1, _std_shanten(reg, k_pre) - magic))
+
+    return best
+
+
+def _shanten(hand: list[int]) -> int:
+    """
+    计算手牌向听数。红中（0x35）作为万能替代任意牌。
+
+    返回：
+      -1 = 已胡（完整手牌）
+       0 = 听牌（差1张胡）
+       1-6 = 差 n 张
+       7   = 6向听以上（上限）
+
+    支持形式：
+      • 标准形：k 组合 + 1 将（(n-2)%3==0 时有效）
+      • 预摸形：等待摸1张的状态（(n-1)%3==0 时有效）
+      • 五対形：5 对子（仅 n==10 时额外计算）
+
+    万能牌处理：
+      先对普通牌计算向听 s，然后 max(-1, s - magic_count)。
+      原理：每张万能牌可直接充当还差的那1张，节省1次摸牌。
+    """
+    cnt = [0] * 19  # 0-17 = 万1-条9，18 = 红中
+    for c in hand:
+        idx = _card_to_idx(c)
+        if 0 <= idx <= 18:
+            cnt[idx] += 1
+
+    magic = cnt[18]
+    reg   = cnt[:18]
+    n     = sum(reg) + magic
+    best  = 8
+
+    # 标准形（(n-2)%3==0，如 n=11,8,5,2...）
+    if n >= 2 and (n - 2) % 3 == 0:
+        k = (n - 2) // 3
+        s = _std_shanten(reg, k)
+        best = min(best, max(-1, s - magic))
+
+    # 预摸形（(n-1)%3==0，如 n=10,7,4...）
+    # 代表"正等待摸1张"的状态，用下一档 k 计算距听牌的步数
+    if n >= 4 and (n - 1) % 3 == 0:
+        k_pre = (n - 1) // 3
+        s = _std_shanten(reg, k_pre)
+        best = min(best, max(-1, s - magic))
+
+    # 五対形（10张完整形，或 11张预摸形）
+    if n == 10 or n == 11:
+        pairs   = sum(c // 2 for c in reg)
+        singles = sum(c % 2 for c in reg)
+        used_m  = min(magic, singles)
+        pairs  += used_m + (magic - used_m) // 2
+        pairs   = min(5, pairs)
+        if n == 10:
+            # 10 张：直接评估
+            best = min(best, max(-1, 4 - pairs))
+        else:
+            # 11 张预摸：假设弃掉 1 张孤立牌（不破坏任何对子）
+            # 若有孤立牌可弃，对数保持不变；否则必须拆对子，对数 -1
+            has_single_or_magic = (singles > 0) or (magic > 0)
+            if has_single_or_magic:
+                best = min(best, max(-1, 4 - pairs))
+            else:
+                best = min(best, max(-1, 4 - (pairs - 1)))
+
+    return best
+
+
+# 副露通道起始偏移
+_SELF_MELD_CH = 161   # 自家副露 Ch161-180（4组×5 = 20通道）
+_OPP_MELD_CH  = 181   # 对家副露 Ch181-200
+
+
+def _make_channels(
+    hand: list[int],
+    opp_hand_count: int = 0,
+    self_kawa: list[KawaEntry] | None = None,
+    opp_kawa: list[KawaEntry] | None = None,
+    self_melds: list[MeldEntry] | None = None,
+    opp_melds: list[MeldEntry] | None = None,
+) -> np.ndarray:
+    """
+    初始化 (CHAN_TOTAL, CARD_TYPES) = (220, 19) 零矩阵，填充结构性通道：
+
+    Ch   0-3  : 自家手牌（stacked one-hot）
+    Ch   4    : 对家手牌数量（全广播）= opp_hand_count / 10
+    Ch   5-82 : 自家河牌（正序9槽 + 倒序28槽 + 4通道时序衰减）
+    Ch  83-160: 对家河牌（同上）
+    Ch 161-180: 自家副露（4组×5通道）
+    Ch 181-200: 对家副露（4组×5通道）
+
+    Ch 201-220（cans/状态类）由 snap() 内联填充。
+    """
+    chs = np.zeros((CHAN_TOTAL, CARD_TYPES), dtype=np.float32)
+    chs[0:4] = _hand_to_ch0_3(hand)
+    chs[4, :] = opp_hand_count / 10.0
+    if self_kawa:
+        _fill_kawa_channels(chs, self_kawa, _SELF_FWD_CH, _SELF_BWD_CH, _SELF_DECAY_CH)
+    if opp_kawa:
+        _fill_kawa_channels(chs, opp_kawa, _OPP_FWD_CH, _OPP_BWD_CH, _OPP_DECAY_CH)
+    if self_melds:
+        _fill_meld_channels(chs, self_melds, _SELF_MELD_CH)
+    if opp_melds:
+        _fill_meld_channels(chs, opp_melds, _OPP_MELD_CH)
+    return chs
+
+
+def _print_sample_channels(sample: "TrainSample") -> None:
+    """打印一个训练样本的通道信息（跳过全零通道）。"""
+    hand_str = " ".join(
+        _card_str(c) for c in sample.hand_snap if c not in (0x00, 0xFF)
+    )
+    print(f"\n{'='*70}")
+    print(f"  事件  : {sample.event}")
+    print(f"  包索引: {sample.pkt_idx}")
+    print(f"  手牌  : {hand_str if hand_str else '(空)'}")
+    print(f"  张数  : {len(sample.hand_snap)}")
+    print(f"  通道形状: {sample.channels.shape}")
+    print(f"  ── 非零通道 ──")
+    has_nonzero = False
+    for ch_idx in range(CHAN_TOTAL):
+        row = sample.channels[ch_idx]
+        if not np.any(row):
+            continue
+        has_nonzero = True
+        parts = [
+            f"{row[i]:.2f}"
+            for i in range(CARD_TYPES)
+        ]
+        print(f"    Ch{ch_idx:03d}: {' | '.join(parts)}")
+    if not has_nonzero:
+        print("    (全为零)")
+    print("="*70)
+
+
+@dataclass
+class TrainSample:
+    """单个训练数据点。"""
+    event:     str           # 决策点事件描述
+    channels:  np.ndarray    # (220, 19) float32 通道矩阵
+    pkt_idx:   int           # 触发该样本的包在 replay.packets 中的索引
+    hand_snap: list[int]     # 该时刻手牌的原始字节快照
+
+
+def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSample]:
+    """
+    以 chairId 为第一视角，扫描回放数据，在以下关键决策点各生成一个训练样本：
+
+    起手阶段（游戏开始 → 庄家首次出牌之间）：
+      case_a  游戏开始，无报胡阶段，庄家直接出牌。
+              触发条件：chairId 的 GAME_START 包 bao_chair == 0xFFFF
+                        且 chairId == banker_chair。
+      case_b  游戏开始，有报胡阶段，自己无报胡选项，所有人决策完毕。
+              触发条件：BAO_HU_NOTIFY current_chair == 0xFFFF
+                        且 chairId 从未出现在 last_chair 中。
+      case_c  轮到自己进行报胡决策。
+              触发条件：GAME_START bao_chair == chairId（第一个）；
+                        或 BAO_HU_NOTIFY current_chair == chairId（后续）。
+      case_d  自己选择了报胡，且有多张打出后仍听牌的牌，需要弃牌决策。
+              触发条件：BAO_HU_NOTIFY current_chair==0xFFFF 且
+                        自己在 last_chair 时 bao_hu_flag==True。
+              （TODO: 完整判断需要 GameLogic 向听计算，当前仅标记决策点）
+      case_e  自己有报胡选项但放弃，所有人决策完毕。
+              触发条件：BAO_HU_NOTIFY current_chair==0xFFFF 且
+                        自己在 last_chair 时 bao_hu_flag==False。
+
+    常规阶段：
+      case_f  发送扑克给自己（抓牌）。
+              触发条件：SEND_CARD current_chair == chairId。
+      case_g  有操作提示（碰/杠/胡等）轮到自己。
+              触发条件：OPERATE_NOTIFY resume_chair == chairId。
+
+    当前仅填充通道 0-3（自家手牌）；其余通道留待后续补充。
+
+    参数：
+        replayData — parseVideoReplay() 返回的回放数据
+        chairId    — 以该椅子号为第一视角
+
+    返回：
+        TrainSample 列表
+    """
+    samples: list[TrainSample] = []
+
+    # ── 手牌状态追踪 ────────────────────────────────────────────
+    hand: list[int] = []              # chairId 当前手牌（原始字节，动态更新）
+    hand_counts: dict[int, int] = {}  # 所有椅子的当前手牌数（用于通道 4）
+
+    # 对家椅号：2人局=另一位；4人局=(chairId+2)%4
+    player_count  = replayData.user_count
+    dui_jia_chair = (chairId + max(1, player_count // 2)) % player_count
+
+    # ── 河牌状态追踪 ────────────────────────────────────────────
+    kawa: dict[int, list[KawaEntry]] = {}   # 各椅子弃牌序列
+    pending_gang: dict[int, int] = {}        # 待写入下次弃牌 Ch0 的杠牌字节
+
+    # ── 副露状态追踪 ────────────────────────────────────────────
+    melds: dict[int, list[MeldEntry]] = {}   # 各椅子副露列表
+
+    # ── 报胡状态 ────────────────────────────────────────────────
+    bao_hu_flags: dict[int, bool] = {}       # 各椅子是否已报胡
+
+    # ── 游戏开始阶段状态 ────────────────────────────────────────
+    game_started       = False
+    banker_chair       = _INVALID_CHAIR
+    bao_chair_first    = _INVALID_CHAIR
+    bao_phase_active   = False
+
+    # 报胡阶段中 chairId 的状态
+    self_bao_hui_turn  = False
+    self_chose_bao_hu  = False
+
+    def snap(
+        event: str,
+        idx: int,
+        action_mask: int = 0,     # 当前帧的动作掩码（来自 SEND_CARD / OPERATE_NOTIFY）
+        trigger_card: int = 0,    # 触发本决策的牌（对家打出，用于 Ch201）
+        is_discard: bool = False, # 是否处于弃牌决策阶段（控制 Ch202）
+        bao_hu_dec: bool = False, # 是否正在进行报胡决策（控制 Ch210/211）
+    ) -> TrainSample:
+        """构造当前状态的训练样本，填充全部已实现通道。"""
+        opp_cnt = hand_counts.get(dui_jia_chair, 0)
+        chs = _make_channels(
+            hand, opp_cnt,
+            kawa.get(chairId),
+            kawa.get(dui_jia_chair),
+            melds.get(chairId),
+            melds.get(dui_jia_chair),
+        )
+
+        # ── Ch 201: 对家刚打出的牌（触发本决策的牌）──────────────
+        if trigger_card:
+            chs[201] = _one_hot_card(trigger_card)
+
+        # ── Ch 202: 自家合法可打出的牌（弃牌阶段才有值）──────────
+        # 红中规则：手里有其他普通牌时红中不可打出；手里全是红中时可以打出
+        _HZ_IDX = 18  # 红中在通道坐标系中的索引
+        _all_hz = all(c == 0x35 for c in hand)  # 手牌是否全为红中
+        if is_discard:
+            for c in hand:
+                ci = _card_to_idx(c)
+                if 0 <= ci < CARD_TYPES:
+                    if ci == _HZ_IDX and not _all_hz:
+                        continue  # 有其他牌时，红中不合法
+                    chs[202, ci] = 1.0
+
+        # ── Ch 203-205: 弃牌候选向听分析（仅弃牌阶段）──────────
+        # ── Ch 203-204: 弃牌候选向听分析（仅弃牌阶段）──────────────
+        # 基线：完整 _shanten（含五対预摸形），取最优策略
+        # 数学性质：弃牌只能维持或增大向听数（单调不减），
+        #           因此 sh_after < sh_now 不可能发生，Ch204 已删除。
+        # 遵守红中弃牌规则：红中不可打出时跳过分析。
+        sh_now = _shanten(hand)
+        if is_discard and hand:
+            seen_cidx: set[int] = set()
+            for card in hand:
+                ci = _card_to_idx(card)
+                if ci < 0 or ci in seen_cidx:
+                    continue
+                if ci == _HZ_IDX and not _all_hz:
+                    continue  # 红中不合法，跳过
+                seen_cidx.add(ci)
+                temp_hand = list(hand)
+                temp_hand.remove(card)
+                sh_after = _shanten(temp_hand)
+                if sh_after == sh_now:
+                    chs[203, ci] = 1.0        # 打出后向听数不变
+                if sh_after == 0:
+                    chs[204, ci] = 1.0        # 打出后直接听牌（原 Ch205）
+
+        # ── Ch 205: 可以碰 ────────────────────────────────────────
+        if action_mask & _WIK_PENG:
+            chs[205, :] = 1.0
+        # ── Ch 206: 可以杠 ────────────────────────────────────────
+        if action_mask & (_WIK_GANG | _WIK_JIA_GANG):
+            chs[206, :] = 1.0
+        # ── Ch 207: 可以胡（吃胡/点炮/自摸均映射到此）────────────
+        if action_mask & (0x40 | 0x80):   # WIK_CHI_HU | WIK_DIAN_PAO
+            chs[207, :] = 1.0
+        # ── Ch 208: 可以请胡 ──────────────────────────────────────
+        if action_mask & 0x20:             # WIK_QING_HU
+            chs[208, :] = 1.0
+        # ── Ch 209: 可以报胡 ──────────────────────────────────────
+        if bao_hu_dec or (action_mask & _WIK_BAO_HU):
+            chs[209, :] = 1.0
+        # ── Ch 210: 可以过（有其他操作选项时均可放弃）────────────
+        if bao_hu_dec or trigger_card or (action_mask & (_WIK_PENG | _WIK_GANG | _WIK_JIA_GANG | 0x40 | 0x80)):
+            chs[210, :] = 1.0
+
+        # ── Ch 211: 自己已报胡 ────────────────────────────────────
+        if bao_hu_flags.get(chairId, False):
+            chs[211, :] = 1.0
+        # ── Ch 212: 对家已报胡 ────────────────────────────────────
+        if bao_hu_flags.get(dui_jia_chair, False):
+            chs[212, :] = 1.0
+
+        # ── Ch 213-218: 向听数 one-hot（全广播）────────────────────
+        # 使用完整 _shanten（含五対形）以准确评估当前手牌质量
+        if 1 <= sh_now <= 5:
+            chs[212 + sh_now, :] = 1.0   # Ch213=1向听 … Ch217=5向听
+        elif sh_now >= 6:
+            chs[218, :] = 1.0            # Ch218=6向听以上
+
+        # ── Ch 219: 红中数量归一化（0张=0, 1张=0.25, …, 4张=1.0）
+        hz_cnt = sum(1 for c in hand if c == 0x35)
+        chs[219, :] = hz_cnt / 4.0
+
+        return TrainSample(event=event, channels=chs, pkt_idx=idx, hand_snap=list(hand))
+
+    for i, pkt in enumerate(replayData.packets):
+        if pkt.main_cmd != MDM_GF_GAME:
+            continue
+        sub = pkt.sub_cmd
+
+        # ══════════════════════════════════════════════════════
+        # 游戏开始 (sub=100)  —— 每个玩家各一包，pkt.chair_id 指示该包属于谁
+        # ══════════════════════════════════════════════════════
+        if sub == 100:
+            buf = _Buf(pkt.payload)
+            buf.read_int()                              # sice_count（骰子）
+            banker_chair_now = buf.read_word()          # 庄家椅子
+            _current         = buf.read_word()          # 当前行动椅子（通常=庄家）
+            bao_chair_now    = buf.read_word()          # 首个报胡决策玩家
+            _action_mask     = buf.read_byte()          # 此包所属玩家的动作掩码
+            _magic           = buf.read_byte()          # 鬼牌
+            raw_hand         = [buf.read_byte() for _ in range(MAX_COUNT)]
+
+            valid_hand = [c for c in raw_hand if c not in (0x00, 0xFF)]
+
+            # 更新所有玩家的起手手牌数
+            hand_counts[pkt.chair_id] = len(valid_hand)
+
+            # 仅 chairId 的包负责初始化自家手牌和全局状态
+            if pkt.chair_id == chairId:
+                hand            = valid_hand
+                banker_chair    = banker_chair_now
+                bao_chair_first = bao_chair_now
+                game_started    = True
+
+                if bao_chair_first == _INVALID_CHAIR:
+                    # ── Case a: 无报胡阶段，庄家直接出牌 ──────────────
+                    if chairId == banker_chair:
+                        samples.append(snap(
+                            "case_a:无报胡阶段_庄家直接出牌", i,
+                            is_discard=True,
+                        ))
+                else:
+                    bao_phase_active = True
+                    # ── Case c（第一个）: 首个报胡决策轮到 chairId ────
+                    if bao_chair_first == chairId:
+                        samples.append(snap(
+                            "case_c:报胡决策(首位)", i,
+                            bao_hu_dec=True,
+                        ))
+
+        # ══════════════════════════════════════════════════════
+        # 报胡提醒 (sub=115)
+        # ══════════════════════════════════════════════════════
+        elif sub == 115 and game_started and bao_phase_active:
+            buf = _Buf(pkt.payload)
+            current_bao = buf.read_word()   # 下一个需要决策的玩家（0xFFFF = 全部结束）
+            last_bao    = buf.read_word()   # 刚完成决策的玩家
+            bao_flag    = buf.read_byte()   # 1=报胡 0=不报
+            _card       = buf.read_byte()   # 相关牌面
+
+            # 记录 chairId 的报胡决策；更新已报胡标志
+            if last_bao == chairId:
+                self_bao_hui_turn = True
+                self_chose_bao_hu = bool(bao_flag)
+            if bao_flag and last_bao != _INVALID_CHAIR:
+                bao_hu_flags[last_bao] = True
+
+            if current_bao == chairId:
+                # ── Case c（后续）: 报胡决策轮到 chairId ──────────
+                samples.append(snap("case_c:报胡决策", i, bao_hu_dec=True))
+
+            elif current_bao == _INVALID_CHAIR:
+                # ── 报胡阶段全部结束，庄家即将出牌 ─────────────────
+                if self_bao_hui_turn:
+                    if self_chose_bao_hu:
+                        # ── Case d: 自己选择了报胡，需要弃牌 ─────────
+                        samples.append(snap(
+                            "case_d:已报胡_弃牌决策", i,
+                            is_discard=True,
+                        ))
+                    else:
+                        # ── Case e: 有报胡选项但放弃 ──────────────────
+                        samples.append(snap(
+                            "case_e:放弃报胡_全部决策完", i,
+                            is_discard=True,
+                        ))
+                else:
+                    # ── Case b: 自己无报胡选项 ─────────────────────────
+                    samples.append(snap(
+                        "case_b:无报胡选项_全部决策完", i,
+                        is_discard=True,
+                    ))
+
+        # ══════════════════════════════════════════════════════
+        # 发送扑克 (sub=102) —— 抓牌
+        # ══════════════════════════════════════════════════════
+        elif sub == 102 and game_started:
+            buf = _Buf(pkt.payload)
+            card          = buf.read_byte()
+            act_mask_b    = buf.read_byte()
+            current_chair = buf.read_word()
+
+            # 所有玩家手牌数 +1
+            if card not in (0x00, 0xFF):
+                hand_counts[current_chair] = hand_counts.get(current_chair, 0) + 1
+
+            if current_chair == chairId:
+                # 先将牌加入手牌，再记录样本（样本反映加牌后的状态）
+                if card not in (0x00, 0xFF):
+                    hand.append(card)
+                # ── Case f: 摸牌 ─────────────────────────────────────
+                samples.append(snap(
+                    "case_f:摸牌", i,
+                    action_mask=act_mask_b,
+                    is_discard=True,
+                ))
+
+        # ══════════════════════════════════════════════════════
+        # 用户出牌 (sub=101) —— 更新手牌 + 创建河牌条目
+        # ══════════════════════════════════════════════════════
+        elif sub == 101 and game_started:
+            buf = _Buf(pkt.payload)
+            _trustee  = buf.read_byte()
+            out_chair = buf.read_word()
+            card      = buf.read_byte()
+
+            if card not in (0x00, 0xFF):
+                # 所有玩家手牌数 -1
+                hand_counts[out_chair] = max(0, hand_counts.get(out_chair, 0) - 1)
+
+                # 创建河牌条目（gang_card 取自本巡的杠，默认无杠）
+                gang_c = pending_gang.pop(out_chair, 0)
+                if out_chair not in kawa:
+                    kawa[out_chair] = []
+                kawa[out_chair].append((gang_c, card, False))
+
+                # 更新 chairId 自家手牌
+                if out_chair == chairId:
+                    try:
+                        hand.remove(card)
+                    except ValueError:
+                        pass  # 异常情况（不应发生）
+
+        # ══════════════════════════════════════════════════════
+        # 操作提示 (sub=104) —— 碰/杠/胡等决策
+        # ══════════════════════════════════════════════════════
+        elif sub == 104 and game_started:
+            buf = _Buf(pkt.payload)
+            resume_chair  = buf.read_word()
+            act_mask_b    = buf.read_byte()
+            act_card_b    = buf.read_byte()
+
+            if resume_chair == chairId:
+                # ── Case g: 操作提示轮到 chairId ─────────────────────
+                samples.append(snap(
+                    "case_g:操作提示", i,
+                    action_mask=act_mask_b,
+                    trigger_card=act_card_b,
+                ))
+
+        # ══════════════════════════════════════════════════════
+        # 操作结果 (sub=105) —— 碰/杠：更新手牌 + 河牌 taken + pending_gang
+        # ══════════════════════════════════════════════════════
+        elif sub == 105 and game_started:
+            buf = _Buf(pkt.payload)
+            operate_chair = buf.read_word()
+            provide_chair = buf.read_word()
+            operate_code  = buf.read_byte()
+            operate_cards = [buf.read_byte() for _ in range(3)]
+
+            valid_op    = [c for c in operate_cards if c not in (0x00, 0xFF)]
+            gang_card_b = valid_op[0] if valid_op else 0  # 副露牌（各张同类型）
+
+            def _mark_last_taken(chair: int) -> None:
+                """将 chair 的最后一条河牌标记为"被拿走"。"""
+                river = kawa.get(chair)
+                if river:
+                    g, d, _ = river[-1]
+                    river[-1] = (g, d, True)
+
+            def _remove_from_hand(n: int) -> None:
+                """从 chairId 手牌移除 n 张 valid_op 中的牌。"""
+                removed = 0
+                for c in valid_op:
+                    if removed >= n:
+                        break
+                    try:
+                        hand.remove(c)
+                        removed += 1
+                    except ValueError:
+                        pass
+
+            def _ensure_melds(chair: int) -> list[MeldEntry]:
+                if chair not in melds:
+                    melds[chair] = []
+                return melds[chair]
+
+            # ── 碰 ──────────────────────────────────────────────────
+            if operate_code & _WIK_PENG:
+                hand_counts[operate_chair] = max(0, hand_counts.get(operate_chair, 0) - 2)
+                _mark_last_taken(provide_chair)
+                _ensure_melds(operate_chair).append(
+                    (gang_card_b, 3, _MELD_PENG)
+                )
+                if operate_chair == chairId:
+                    _remove_from_hand(2)
+
+            # ── 直杠（他人打出的牌被杠走）─────────────────────────
+            elif operate_code & _WIK_GANG and provide_chair != operate_chair:
+                hand_counts[operate_chair] = max(0, hand_counts.get(operate_chair, 0) - 3)
+                _mark_last_taken(provide_chair)
+                pending_gang[operate_chair] = gang_card_b
+                _ensure_melds(operate_chair).append(
+                    (gang_card_b, 4, _MELD_ZHIGANG)
+                )
+                if operate_chair == chairId:
+                    _remove_from_hand(3)
+
+            # ── 暗杠（4张全在手里）─────────────────────────────────
+            elif operate_code & _WIK_GANG and provide_chair == operate_chair:
+                hand_counts[operate_chair] = max(0, hand_counts.get(operate_chair, 0) - 4)
+                pending_gang[operate_chair] = gang_card_b
+                _ensure_melds(operate_chair).append(
+                    (gang_card_b, 4, _MELD_ANGANG)
+                )
+                if operate_chair == chairId:
+                    _remove_from_hand(4)
+
+            # ── 加杠（将已有碰副露升级为杠）────────────────────────
+            elif operate_code & _WIK_JIA_GANG:
+                hand_counts[operate_chair] = max(0, hand_counts.get(operate_chair, 0) - 1)
+                pending_gang[operate_chair] = gang_card_b
+                # 将已有碰副露升级为加杠副露
+                chair_melds = _ensure_melds(operate_chair)
+                upgraded = False
+                for mi, (mc, mn, mt) in enumerate(chair_melds):
+                    if mc == gang_card_b and mt == _MELD_PENG:
+                        chair_melds[mi] = (mc, 4, _MELD_JIAGANG)
+                        upgraded = True
+                        break
+                if not upgraded:
+                    chair_melds.append((gang_card_b, 4, _MELD_JIAGANG))
+                if operate_chair == chairId:
+                    _remove_from_hand(1)
+
+    return samples
+
+
+def generalTrainDataByVideo(replay: VideoReplay) -> list[TrainSample]:
+    print(f"\n{'#'*70}")
+    print(f"# 玩家数={replay.user_count}  总包数={len(replay.packets)}")
+    print(f"{'#'*70}")
+
+    all_samples: list[TrainSample] = []
+
+    for chair_id in range(replay.user_count):
+        user = next((u for u in replay.users if u.chair_id == chair_id), None)
+        nick = user.nick if user else "?"
+        print(f"\n{'─'*70}")
+        print(f" chair{chair_id} ({nick}) 的训练样本")
+        print(f"{'─'*70}")
+
+        chair_samples = generalChairTrainData(replay, chair_id)
+        print(f"  生成样本数: {len(chair_samples)}")
+
+        for s in chair_samples:
+            _print_sample_channels(s)
+
+        all_samples.extend(chair_samples)
+
+    print(f"\n{'#'*70}")
+    print(f"# 全部生成: {len(all_samples)} 个训练样本")
+    print(f"# 通道矩阵形状: ({len(all_samples)}, {CHAN_TOTAL}, {CARD_TYPES})")
+    print(f"{'#'*70}")
+
+    return all_samples
+
+
+# ──────────────────────────────────────────────
 # 入口
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    TEST_FILE = "res/battleReplay/61263_20260618/09856202606180244201.video"
+    replay = parseVideoReplay(TEST_FILE)
+    generalTrainDataByVideo(replay)
     testParseVideoReplay()
