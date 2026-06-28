@@ -35,8 +35,10 @@ from scyxjy import (
     _std_shanten,
     _shanten,
     _shanten_std,
-    generalChairTrainData, _print_sample_channels,
+    generalChairTrainData, _print_sample_channels, parseVideoReplay,
 )
+from scyxjy_gen_trainData import _extract_reward, REWARD_NORM, _determine_action, ACTION_BAO_HU, _mask_from_channels, \
+    ACTION_PASS
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1231,23 +1233,23 @@ class TestXiangTingChannel(unittest.TestCase):
         replay = (
             ReplayBuilder(n=2)
             .game_starts(banker=0, hands={0: hand, 1: opp})
-            .discard(0,0x16)
-            .send(1,0x17)
-            .discard(1,0x17)
-            .send(0,0x29)
-            .discard(0,0x22)
-            .send(1,0x13)
-            .discard(1,0x13)
-            .operate_notify(0,_WIK_PENG,0x13)
-            .operate_result(0,1,_WIK_PENG,[0x13]*3)
-            .discard(0,0x29)
-            .send(1,0x14)
-            .discard(1,0x14)
+            .discard(0, 0x16)
+            .send(1, 0x17)
+            .discard(1, 0x17)
+            .send(0, 0x29)
+            .discard(0, 0x22)
+            .send(1, 0x13)
+            .discard(1, 0x13)
+            .operate_notify(0, _WIK_PENG, 0x13)
+            .operate_result(0, 1, _WIK_PENG, [0x13] * 3)
+            .discard(0, 0x29)
+            .send(1, 0x14)
+            .discard(1, 0x14)
             .operate_notify(0, _WIK_PENG, 0x14)
             .operate_result(0, 1, _WIK_PENG, [0x14] * 3)
-            .discard(0,0x23)
-            .send(1,0x26)
-            .discard(1,0x26)
+            .discard(0, 0x23)
+            .send(1, 0x26)
+            .discard(1, 0x26)
             .operate_notify(0, _WIK_PENG, 0x26)
             .operate_result(0, 1, _WIK_PENG, [0x26] * 3)
             .discard(0, 0x22)
@@ -1272,6 +1274,92 @@ class TestXiangTingChannel(unittest.TestCase):
         self.assertAlmostEqual(samples[1].channels[24, 5], 1.0, msg="倒第一轮弃牌6万")
         self.assertAlmostEqual(samples[1].channels[79, 5], 1.0, msg="弃牌时间衰减")
 
+    def test_baohu_1(self):
+        hand = [0x11, 0x13, 0x13, 0x14, 0x14, 0x17, 0x18, 0x22, 0x23, 0x24, 0x35]
+        opp = [0x21, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29]
+        replay = (
+            ReplayBuilder(n=2)
+            .game_starts(banker=0, hands={0: hand, 1: opp}, bao_chair=0)
+            .operate_notify(0, _WIK_BAO_HU, 0x11)
+            .build()
+        )
+        samples = _run_chair(replay, chair_id=0)
+        self.assertTrue(np.allclose(samples[0].channels[4], 1.0), msg="对家手牌必须要有值")
+
+        # samples[1] = case_g:操作提示（WIK_BAO_HU 弃牌选择阶段）
+        s_bao = samples[1]
+        self.assertEqual(s_bao.event, "case_g:操作提示", "第2个样本应是操作提示")
+
+        # 手牌 shanten=0（已听牌），Ch213-218 应全为 0（不需要设向听通道）
+        for ch in range(213, 219):
+            self.assertTrue(np.allclose(s_bao.channels[ch], 0.0),
+                            f"手牌已听牌，Ch{ch} 应全为 0")
+
+        # Ch202：合法弃牌（手中有普通牌，红中不合法）
+        ci_hz = _card_to_idx(0x35)
+        self.assertAlmostEqual(s_bao.channels[202, ci_hz], 0.0,
+                               msg="有普通牌时红中不可弃，Ch202[红中]=0")
+        ci_1w = _card_to_idx(0x11)
+        self.assertAlmostEqual(s_bao.channels[202, ci_1w], 1.0,
+                               msg="1万合法可弃，Ch202[1万]=1")
+
+        # Ch203：弃后向听不变（=0）的牌 → 弃1万或3万后仍听牌
+        ci_3w = _card_to_idx(0x13)
+        self.assertAlmostEqual(s_bao.channels[203, ci_1w], 1.0,
+                               msg="弃1万后仍tenpai → Ch203[1万]=1")
+        self.assertAlmostEqual(s_bao.channels[203, ci_3w], 1.0,
+                               msg="弃3万后仍tenpai → Ch203[3万]=1")
+
+        # 弃掉条子/7万/8万/4万后 shanten=1，不应在 Ch203
+        for bad_card in [0x14, 0x17, 0x18, 0x22, 0x23, 0x24]:
+            ci = _card_to_idx(bad_card)
+            self.assertAlmostEqual(s_bao.channels[203, ci], 0.0,
+                                   msg=f"弃{bad_card:#04x}后shanten=1 → Ch203 应=0")
+
+        # 报胡弃牌阶段 Ch202 只保留打后仍听牌的牌（= Ch203）
+        # 4万打出后 shanten=1，不应出现在 Ch202
+        ci_4w = _card_to_idx(0x14)
+        self.assertAlmostEqual(s_bao.channels[202, ci_4w], 0.0,
+                               msg="4万打出后不再听牌，报胡阶段Ch202[4万]应=0")
+        self.assertTrue(np.allclose(samples[0].channels[201], 0.0), msg="此时还没有对家打出的牌")
+
+        self.assertTrue(np.allclose(samples[1].channels[211], 1.0), msg="已经做了报胡决策，自己的报胡标志")
+        self.assertAlmostEqual(samples[1].channels[202, 0], 1.0, msg="可以弃1万")
+        self.assertAlmostEqual(samples[1].channels[202, 2], 1.0, msg="可以弃3万")
+        self.assertAlmostEqual(samples[1].channels[202, 3], 0.0, msg="不可以弃4万")
+        self.assertAlmostEqual(samples[1].channels[203, 0], 1.0, msg="打1万向听数不变")
+        self.assertAlmostEqual(samples[1].channels[203, 2], 1.0, msg="打3万向听数不变")
+        self.assertAlmostEqual(samples[1].channels[204, 0], 1.0, msg="打1万听牌")
+        self.assertAlmostEqual(samples[1].channels[204, 2], 1.0, msg="打3万听牌")
+
+    def test_mask_action(self):
+        file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
+        replay = parseVideoReplay(file_path)
+        samples = generalChairTrainData(replay, 1)
+        for s in samples:
+            _print_sample_channels(s)
+        reward = _extract_reward(replay, 1)
+        self.assertAlmostEqual(reward, 10.0 / REWARD_NORM, msg="得分是10")
+
+        reward = _extract_reward(replay, 0)
+        self.assertAlmostEqual(reward, -10.0 / REWARD_NORM, msg="对家得分是-10")
+
+        action = _determine_action(
+            replay.packets, samples[0].pkt_idx, samples[0].event, 1
+        )
+        self.assertAlmostEqual(action, ACTION_BAO_HU, msg="做的是报胡决策")
+        mask = _mask_from_channels(samples[0].channels)
+        self.assertTrue(mask[ACTION_BAO_HU], msg="有报胡决策")
+        self.assertTrue(mask[ACTION_PASS], msg="可以过")
+
+        # 报胡弃牌阶段
+        action = _determine_action(
+            replay.packets, samples[1].pkt_idx, samples[1].event, 1
+        )
+        self.assertAlmostEqual(action, 0, msg="打的是1万")
+        mask = _mask_from_channels(samples[1].channels)
+        self.assertTrue(mask[0], msg="可以打1万")
+        self.assertTrue(mask[2], msg="可以打3万")
 
 # ══════════════════════════════════════════════════════════════════════
 #  入口

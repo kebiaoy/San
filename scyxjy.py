@@ -996,7 +996,7 @@ def downloadTeaReplay(group_id: int, limit: int | None = None) -> None:
     print(f"文件保存在：{save_dir}")
 
 
-def testParseVideoReplay():
+def testParseVideoReplay(filePath:str):
     import datetime as _dt
     from collections import Counter
 
@@ -1005,7 +1005,7 @@ def testParseVideoReplay():
     # 有报胡测试
     #TEST_FILE = "res/battleReplay/61263_20260618/09856202606180204803.video"
 
-    TEST_FILE = "res/battleReplay/61263_20260618/09856202606180244201.video"
+    TEST_FILE = filePath
     replay = parseVideoReplay(TEST_FILE)
 
     print("=" * 60)
@@ -1592,6 +1592,25 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
     player_count  = replayData.user_count
     dui_jia_chair = (chairId + max(1, player_count // 2)) % player_count
 
+    # ── 预扫描：提前收集所有玩家的起手手牌数 ──────────────────────
+    # 目的：GAME_START 包按椅子顺序下发，自己的包先到就先生成样本；
+    # 若不预扫描，生成 case_c/a 时对家手牌数尚未登记，Ch4 会错误为 0。
+    for _pre_pkt in replayData.packets:
+        if _pre_pkt.main_cmd != MDM_GF_GAME or _pre_pkt.sub_cmd != 100:
+            continue
+        _pre_buf = _Buf(_pre_pkt.payload)
+        _pre_buf.read_int()    # sice_count
+        _pre_buf.read_word()   # banker_chair
+        _pre_buf.read_word()   # current_chair
+        _pre_buf.read_word()   # bao_chair
+        _pre_buf.read_byte()   # action_mask
+        _pre_buf.read_byte()   # magic_card
+        if _pre_buf.remaining() >= MAX_COUNT:
+            _pre_hand = [_pre_buf.read_byte() for _ in range(MAX_COUNT)]
+            hand_counts[_pre_pkt.chair_id] = len(
+                [c for c in _pre_hand if c not in (0x00, 0xFF)]
+            )
+
     # ── 河牌状态追踪 ────────────────────────────────────────────
     kawa: dict[int, list[KawaEntry]] = {}   # 各椅子弃牌序列
     pending_gang: dict[int, int] = {}        # 待写入下次弃牌 Ch0 的杠牌字节
@@ -1615,10 +1634,10 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
     def snap(
         event: str,
         idx: int,
-        action_mask: int = 0,     # 当前帧的动作掩码（来自 SEND_CARD / OPERATE_NOTIFY）
-        trigger_card: int = 0,    # 触发本决策的牌（对家打出，用于 Ch201）
-        is_discard: bool = False, # 是否处于弃牌决策阶段（控制 Ch202）
-        bao_hu_dec: bool = False, # 是否正在进行报胡决策（控制 Ch210/211）
+        action_mask: int = 0,          # 当前帧的动作掩码（来自 SEND_CARD / OPERATE_NOTIFY）
+        trigger_card: int = 0,         # 触发本决策的牌（对家打出，用于 Ch201）
+        is_discard: bool = False,      # 是否处于弃牌决策阶段（控制 Ch202）
+        bao_hu_dec: bool = False,      # 是否正在进行报胡决策（控制 Ch210/211）
     ) -> TrainSample:
         """构造当前状态的训练样本，填充全部已实现通道。"""
         opp_cnt = hand_counts.get(dui_jia_chair, 0)
@@ -1669,6 +1688,11 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
                     chs[203, ci] = 1.0        # 打出后向听数不变
                 if sh_after == 0:
                     chs[204, ci] = 1.0        # 打出后直接听牌（原 Ch205）
+
+        # 玩家已报胡后，所有弃牌阶段的合法出牌（Ch202）都收窄为"打出后仍听牌"的牌。
+        # 报胡规则：报胡后每次弃牌必须维持听牌状态，否则报胡失去意义。
+        if is_discard and bao_hu_flags.get(chairId, False):
+            chs[202] = chs[203].copy()
 
         # ── Ch 205: 可以碰 ────────────────────────────────────────
         if action_mask & _WIK_PENG:
@@ -1725,6 +1749,9 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
             bao_chair_now    = buf.read_word()          # 首个报胡决策玩家
             _action_mask     = buf.read_byte()          # 此包所属玩家的动作掩码
             _magic           = buf.read_byte()          # 鬼牌
+            # 手牌数据只在目标椅子的包中存在（至少需要 MAX_COUNT 字节）
+            if buf.remaining() < MAX_COUNT:
+                continue
             raw_hand         = [buf.read_byte() for _ in range(MAX_COUNT)]
 
             valid_hand = [c for c in raw_hand if c not in (0x00, 0xFF)]
@@ -1858,11 +1885,28 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
             act_card_b    = buf.read_byte()
 
             if resume_chair == chairId:
+                # Ch201 仅用于"对家打牌后触发"的操作（碰/直杠/吃胡/点炮）。
+                # 报胡（WIK_BAO_HU）：action_card 是报叫的牌，是自己的牌，不设 Ch201。
+                # 加杠（WIK_JIA_GANG）：action_card 是自己摸的牌，扩展已有碰副露，不设 Ch201。
+                _OPP_CARD_MASK = 0x02 | 0x04 | 0x40 | 0x80  # 碰|直杠|吃胡|点炮
+                trigger = act_card_b if (act_mask_b & _OPP_CARD_MASK) else 0
+
+                # 报胡 OPERATE_NOTIFY 是弃牌选择阶段：
+                # 玩家需要从手牌中选一张打出（只有打出后仍听牌的才合法），
+                # 因此设 is_discard=True 以填充 Ch202/203/204 弃牌候选通道。
+                is_bao_hu = bool(act_mask_b & _WIK_BAO_HU)
+
+                # OPERATE_NOTIFY WIK_BAO_HU 是服务器让玩家选择报叫牌的阶段，
+                # 意味着该玩家已经提交了"报胡"意向（yes），在 snap 前标记已报胡。
+                if is_bao_hu:
+                    bao_hu_flags[chairId] = True
+
                 # ── Case g: 操作提示轮到 chairId ─────────────────────
                 samples.append(snap(
                     "case_g:操作提示", i,
                     action_mask=act_mask_b,
-                    trigger_card=act_card_b,
+                    trigger_card=trigger,
+                    is_discard=is_bao_hu,
                 ))
 
         # ══════════════════════════════════════════════════════
@@ -1954,33 +1998,66 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
 
 
 def generalTrainDataByVideo(replay: VideoReplay) -> list[TrainSample]:
-    print(f"\n{'#'*70}")
-    print(f"# 玩家数={replay.user_count}  总包数={len(replay.packets)}")
-    print(f"{'#'*70}")
-
     all_samples: list[TrainSample] = []
 
     for chair_id in range(replay.user_count):
-        user = next((u for u in replay.users if u.chair_id == chair_id), None)
-        nick = user.nick if user else "?"
-        print(f"\n{'─'*70}")
-        print(f" chair{chair_id} ({nick}) 的训练样本")
-        print(f"{'─'*70}")
-
         chair_samples = generalChairTrainData(replay, chair_id)
-        print(f"  生成样本数: {len(chair_samples)}")
-
-        for s in chair_samples:
-            _print_sample_channels(s)
-
         all_samples.extend(chair_samples)
 
-    print(f"\n{'#'*70}")
-    print(f"# 全部生成: {len(all_samples)} 个训练样本")
-    print(f"# 通道矩阵形状: ({len(all_samples)}, {CHAN_TOTAL}, {CARD_TYPES})")
-    print(f"{'#'*70}")
-
     return all_samples
+
+
+# ──────────────────────────────────────────────
+# 工具：查找含报胡操作的回放文件
+# ──────────────────────────────────────────────
+
+def findBaoHuReplays(dir_path: str | Path) -> list[str]:
+    """
+    扫描目录下所有 .video 回放文件，打印并返回含有报胡操作的文件路径。
+
+    "有报胡操作"的判定标准：
+        回放中存在至少一个 BAO_HU_NOTIFY (sub_cmd=115) 数据包，
+        且该包的 bao_hu_flag == 1（即有玩家实际选择了报胡，而非仅拒绝）。
+
+    参数：
+        dir_path — 回放文件目录（递归搜索所有 .video 文件）
+
+    返回：
+        匹配的文件路径字符串列表
+    """
+    dir_path = Path(dir_path)
+    all_videos = sorted(dir_path.rglob("*.video"))
+    total = len(all_videos)
+    print(f"扫描目录：{dir_path}")
+    print(f"共发现 {total} 个 .video 文件，开始检测报胡操作...")
+    print("-" * 60)
+
+    found: list[str] = []
+
+    for idx, fp in enumerate(all_videos, 1):
+        try:
+            replay = parseVideoReplay(fp)
+            has_bao_hu = False
+            for pkt in replay.packets:
+                if pkt.main_cmd != MDM_GF_GAME or pkt.sub_cmd != 115:
+                    continue
+                # 快速从原始 payload 读取 bao_hu_flag（偏移 4 字节处）
+                # 协议：word current_chair(2) + word last_chair(2) + byte bao_hu_flag(1)
+                if len(pkt.payload) >= 5 and pkt.payload[4] == 1:
+                    has_bao_hu = True
+                    break
+            if has_bao_hu:
+                found.append(str(fp))
+                print(str(fp))
+        except Exception as e:
+            print(f"  [解析失败] {fp}: {e}", file=sys.stderr)
+
+        if idx % 500 == 0:
+            print(f"  进度：{idx}/{total}，已找到 {len(found)} 个含报胡文件...")
+
+    print("-" * 60)
+    print(f"扫描完成！共 {len(found)} 个文件含有报胡操作（bao_hu_flag=1）。")
+    return found
 
 
 # ──────────────────────────────────────────────
@@ -1988,7 +2065,12 @@ def generalTrainDataByVideo(replay: VideoReplay) -> list[TrainSample]:
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    TEST_FILE = "res/battleReplay/61263_20260618/09856202606180244201.video"
-    replay = parseVideoReplay(TEST_FILE)
-    generalTrainDataByVideo(replay)
-    testParseVideoReplay()
+    # 查找含报胡操作的回放文件
+   # findBaoHuReplays("/Users/kebiaoy/Documents/MjTrainData")
+    file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
+    testParseVideoReplay(file_path)
+    replay = parseVideoReplay(file_path)
+    samples = generalTrainDataByVideo(replay)
+    for s in samples:
+        _print_sample_channels(s)
+
