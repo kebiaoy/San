@@ -62,8 +62,8 @@ WEIGHT_DECAY = 1e-4
 EPOCHS       = 100
 SAVE_EVERY   = 10      # 每 N epoch 保存一次 checkpoint
 
-CONV_CHANNELS = 128    # Brain 卷积通道数（初始训练用小模型）
-NUM_BLOCKS    = 20     # ResBlock 数量
+CONV_CHANNELS = 192    # Brain 卷积通道数（初始训练用小模型）
+NUM_BLOCKS    = 40     # ResBlock 数量
 
 
 # ──────────────────────────────────────────────────────────

@@ -2064,9 +2064,7 @@ def findSpecialGangReplays(dir_path: str | Path) -> dict[str, list[str]]:
                 # 刮风/下雨: GAME_ACTION_NOTIFY (112)，payload[0]=action_type
                 elif sub == 112 and len(payload) >= 1:
                     atype = payload[0]
-                    if atype == 0x01:
-                        flags["刮风"] = True
-                    elif atype == 0x02:
+                    if atype == 0x02:
                         flags["下雨"] = True
                 if all(flags.values()):
                     break  # 三种都找到了，提前退出
@@ -2151,13 +2149,10 @@ def findBaoHuReplays(dir_path: str | Path) -> list[str]:
 if __name__ == "__main__":
     # 查找含报胡操作的回放文件
    # findBaoHuReplays("/Users/kebiaoy/Documents/MjTrainData")
-   # findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
+    #findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
     # 报胡回放
     # file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
-    file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09887202606187562501.video"
+    file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09883202606188568101.video"
     testParseVideoReplay(file_path)
-    replay = parseVideoReplay(file_path)
-    samples = generalTrainDataByVideo(replay)
-    for s in samples:
-        _print_sample_channels(s)
+
 

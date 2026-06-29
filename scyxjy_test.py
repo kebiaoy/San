@@ -1334,8 +1334,7 @@ class TestXiangTingChannel(unittest.TestCase):
         file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
         replay = parseVideoReplay(file_path)
         samples = generalChairTrainData(replay, 1)
-        for s in samples:
-            _print_sample_channels(s)
+
 
         self.assertAlmostEqual(len(samples), 3, msg="只有报胡决策，报胡弃牌，自摸三个动作")
 
@@ -1362,6 +1361,12 @@ class TestXiangTingChannel(unittest.TestCase):
         self.assertTrue(mask[0], msg="可以打1万")
         self.assertTrue(mask[2], msg="可以打3万")
 
+    def test_fulu(self):
+        file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09883202606188568101.video"
+        replay = parseVideoReplay(file_path)
+        samples = generalChairTrainData(replay, 1)
+        for s in samples:
+            _print_sample_channels(s)
 # ══════════════════════════════════════════════════════════════════════
 #  入口
 # ══════════════════════════════════════════════════════════════════════
