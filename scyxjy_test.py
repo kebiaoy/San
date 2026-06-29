@@ -1261,8 +1261,6 @@ class TestXiangTingChannel(unittest.TestCase):
         # 含 2 张红中，验证 Ch219=0.50
         hand = [0x13, 0x13, 0x14, 0x14, 0x16, 0x19, 0x22, 0x23, 0x26, 0x26, 0x29]
         samples = self._run(hand)
-        for s in samples:
-            _print_sample_channels(s)
         self.assertAlmostEqual(samples[0].channels[203, 5], 1.0, msg="可以打出6万")
         self.assertAlmostEqual(samples[0].channels[203, 8], 1.0, msg="可以打出9万")
         self.assertAlmostEqual(samples[0].channels[203, 10], 1.0, msg="可以打出2条")
@@ -1338,6 +1336,9 @@ class TestXiangTingChannel(unittest.TestCase):
         samples = generalChairTrainData(replay, 1)
         for s in samples:
             _print_sample_channels(s)
+
+        self.assertAlmostEqual(len(samples), 3, msg="只有报胡决策，报胡弃牌，自摸三个动作")
+
         reward = _extract_reward(replay, 1)
         self.assertAlmostEqual(reward, 10.0 / REWARD_NORM, msg="得分是10")
 

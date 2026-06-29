@@ -1843,11 +1843,22 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
                 if card not in (0x00, 0xFF):
                     hand.append(card)
                 # ── Case f: 摸牌 ─────────────────────────────────────
-                samples.append(snap(
-                    "case_f:摸牌", i,
-                    action_mask=act_mask_b,
-                    is_discard=True,
-                ))
+                # 报胡后出牌由系统托管：只有可胡或可杠时才生成决策样本
+                _HU_GANG_MASK = 0x04 | 0x08 | 0x40 | 0x80
+                if bao_hu_flags.get(chairId, False):
+                    if act_mask_b & _HU_GANG_MASK:
+                        samples.append(snap(
+                            "case_f:摸牌", i,
+                            action_mask=act_mask_b,
+                            is_discard=False,
+                        ))
+                    # 否则系统托管弃牌，不需要决策，跳过
+                else:
+                    samples.append(snap(
+                        "case_f:摸牌", i,
+                        action_mask=act_mask_b,
+                        is_discard=True,
+                    ))
 
         # ══════════════════════════════════════════════════════
         # 用户出牌 (sub=101) —— 更新手牌 + 创建河牌条目
@@ -2011,6 +2022,79 @@ def generalTrainDataByVideo(replay: VideoReplay) -> list[TrainSample]:
 # 工具：查找含报胡操作的回放文件
 # ──────────────────────────────────────────────
 
+def findSpecialGangReplays(dir_path: str | Path) -> dict[str, list[str]]:
+    """
+    扫描目录下所有 .video 回放文件，查找含有「面下杠/刮风/下雨」的文件。
+
+    判定标准：
+      · 面下杠（加杠）: OPERATE_RESULT (sub=105) 中 operate_code & WIK_JIA_GANG (0x08)
+      · 刮风（直杠）  : GAME_ACTION_NOTIFY (sub=112) 中 action_type == 0x01
+      · 下雨（暗杠）  : GAME_ACTION_NOTIFY (sub=112) 中 action_type == 0x02
+
+    参数：
+        dir_path — 回放文件目录（递归搜索所有 .video 文件）
+
+    返回：
+        {"面下杠": [...], "刮风": [...], "下雨": [...]}
+        每个键对应包含该操作的文件路径列表（三者可重叠）
+    """
+    dir_path = Path(dir_path)
+    all_videos = sorted(dir_path.rglob("*.video"))
+    total = len(all_videos)
+    print(f"扫描目录：{dir_path}")
+    print(f"共发现 {total} 个 .video 文件，开始检测面下杠/刮风/下雨...")
+    print("-" * 60)
+
+    found: dict[str, list[str]] = {"面下杠": [], "刮风": [], "下雨": []}
+
+    for idx, fp in enumerate(all_videos, 1):
+        try:
+            replay = parseVideoReplay(fp)
+            flags = {"面下杠": False, "刮风": False, "下雨": False}
+            for pkt in replay.packets:
+                if pkt.main_cmd != MDM_GF_GAME:
+                    continue
+                sub = pkt.sub_cmd
+                payload = pkt.payload
+                # 面下杠（加杠）: OPERATE_RESULT (105)，operate_code & WIK_JIA_GANG(0x08)
+                # payload 布局：word operate_chair(2) + word provide_chair(2) + byte operate_code(1)
+                if sub == 105 and len(payload) >= 5:
+                    if payload[4] & 0x08:
+                        flags["面下杠"] = True
+                # 刮风/下雨: GAME_ACTION_NOTIFY (112)，payload[0]=action_type
+                elif sub == 112 and len(payload) >= 1:
+                    atype = payload[0]
+                    if atype == 0x01:
+                        flags["刮风"] = True
+                    elif atype == 0x02:
+                        flags["下雨"] = True
+                if all(flags.values()):
+                    break  # 三种都找到了，提前退出
+
+            for key, hit in flags.items():
+                if hit:
+                    found[key].append(str(fp))
+
+        except Exception as e:
+            print(f"  [解析失败] {fp}: {e}", file=sys.stderr)
+
+        if idx % 500 == 0:
+            print(f"  进度：{idx}/{total}  面下杠={len(found['面下杠'])}  "
+                  f"刮风={len(found['刮风'])}  下雨={len(found['下雨'])}")
+
+    print("-" * 60)
+    print(f"扫描完成！")
+    print(f"  含面下杠（加杠）：{len(found['面下杠'])} 个文件")
+    print(f"  含刮风（直杠）  ：{len(found['刮风'])} 个文件")
+    print(f"  含下雨（暗杠）  ：{len(found['下雨'])} 个文件")
+    for key, paths in found.items():
+        if paths:
+            print(f"\n── {key} ──")
+            for p in paths:
+                print(p)
+    return found
+
+
 def findBaoHuReplays(dir_path: str | Path) -> list[str]:
     """
     扫描目录下所有 .video 回放文件，打印并返回含有报胡操作的文件路径。
@@ -2067,7 +2151,10 @@ def findBaoHuReplays(dir_path: str | Path) -> list[str]:
 if __name__ == "__main__":
     # 查找含报胡操作的回放文件
    # findBaoHuReplays("/Users/kebiaoy/Documents/MjTrainData")
-    file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
+   # findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
+    # 报胡回放
+    # file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
+    file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09887202606187562501.video"
     testParseVideoReplay(file_path)
     replay = parseVideoReplay(file_path)
     samples = generalTrainDataByVideo(replay)
