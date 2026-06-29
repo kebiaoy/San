@@ -40,6 +40,7 @@ from torch import Tensor
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader
+import platform
 
 from san_model import (
     SanModel,
@@ -49,8 +50,17 @@ from san_model import (
 # ──────────────────────────────────────────────────────────
 # 超参默认值
 # ──────────────────────────────────────────────────────────
-DATA_DIR     = Path("/Users/kebiaoy/Documents/MjTrainData/train_data")
-CKPT_DIR     = Path("/Users/kebiaoy/workspace/San/checkpoints")
+
+sys_os = platform.system()
+if sys_os == "Windows":
+    SRC_DIR     = Path("E:\\Train")
+    DATA_DIR = Path("E:\\Train\\train_data")
+    CKPT_DIR = Path("E:\\Train\\checkpoints")
+elif sys_os == "Darwin":
+    DATA_DIR = Path("/Users/kebiaoy/Documents/MjTrainData/train_data")
+    CKPT_DIR = Path("/Users/kebiaoy/workspace/San/checkpoints")
+
+
 
 GAMMA        = 0.99    # Monte-Carlo 折扣因子
 CQL_WEIGHT   = 1.0     # CQL 损失权重（初始训练保守值，MPS 上过大会爆炸）

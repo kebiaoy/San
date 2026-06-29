@@ -30,6 +30,10 @@ import numpy as np
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import platform
+
+
+
 sys.path.insert(0, str(Path(__file__).parent))
 from scyxjy import (
     parseVideoReplay, VideoReplay,
@@ -44,7 +48,14 @@ from scyxjy import (
 # ──────────────────────────────────────────────────────────
 # 路径 & 超参
 # ──────────────────────────────────────────────────────────
-SRC_DIR     = Path("/Users/kebiaoy/Documents/MjTrainData")
+
+# 判断系统
+sys_os = platform.system()
+if sys_os == "Windows":
+    SRC_DIR     = Path("E:\\Train")
+elif sys_os == "Darwin":
+    SRC_DIR     = Path("/Users/kebiaoy/Documents/MjTrainData")
+
 OUT_DIR     = SRC_DIR / "train_data"
 GAMMA       = 0.99
 REWARD_NORM = 64.0   # reward = game_score / (REWARD_NORM * cell_score)
