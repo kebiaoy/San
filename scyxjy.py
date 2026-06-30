@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
-
+import platform
 import numpy as np
 
 import requests
@@ -881,10 +881,14 @@ def downloadTeaReplay(group_id: int, limit: int | None = None) -> None:
     """
     yesterday = datetime.date.today() - datetime.timedelta(days=1)
     date_str = yesterday.strftime("%Y%m%d")
-
-    base_dir = Path(__file__).parent
-    save_dir = base_dir / "res" / "battleReplay" / f"{group_id}_{date_str}"
-    save_dir.mkdir(parents=True, exist_ok=True)
+    sys_os = platform.system()
+    if sys_os == "Windows":
+        base_dir = Path(__file__).parent
+        save_dir = base_dir / "res" / "battleReplay" / f"{group_id}_{date_str}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+    elif sys_os == "Darwin":
+        save_dir = "/Users/kebiaoy/Documents/MjTrainData" / f"{group_id}_{date_str}"
+        save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"茶馆 {group_id}  昨日（{date_str}）回放下载")
     print(f"保存目录：{save_dir}")
@@ -2152,7 +2156,10 @@ if __name__ == "__main__":
     #findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
     # 报胡回放
     # file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
-    file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09883202606188568101.video"
-    testParseVideoReplay(file_path)
+    #file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09883202606188568101.video"
+    #testParseVideoReplay(file_path)
 
+    # 检测活跃茶馆
+    # checkActiveTea(61000,600,1000)
+    downloadTeaReplay(61464)
 

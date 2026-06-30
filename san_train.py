@@ -58,7 +58,7 @@ if sys_os == "Windows":
     CKPT_DIR = Path("E:\\Train\\checkpoints")
 elif sys_os == "Darwin":
     DATA_DIR = Path("/Users/kebiaoy/Documents/MjTrainData/train_data")
-    CKPT_DIR = Path("/Users/kebiaoy/workspace/San/checkpoints")
+    CKPT_DIR = Path("/Users/kebiaoy/Documents/MjTrainData/checkpoints")
 
 
 
