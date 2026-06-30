@@ -219,7 +219,7 @@ def train(args) -> None:
         "mps"   if torch.backends.mps.is_available() else
         "cpu"
     )
-    print(f"使用设备：{device}")
+    print(f"使用设备：{device} 训练目录：{args.data_dir} 训练周期:{args.epochs} 续训：{args.resume}")
 
     # ── 数据加载 ───────────────────────────────────────────
     dataset = SanDataset(Path(args.data_dir), gamma=args.gamma)

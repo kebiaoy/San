@@ -125,7 +125,7 @@ def main(args):
         "mps"   if torch.backends.mps.is_available() else
         "cpu"
     )
-    print(f"使用设备：{device}")
+    print(f"使用设备：{device} 验证集目录 :{args.val_dir} 权重目录:{args.ckpt_dir}")
 
     val_data = load_val_data(val_dir, gamma=args.gamma)
 
@@ -174,12 +174,12 @@ def _parse_args():
     p = argparse.ArgumentParser(description="评估所有 checkpoint 并生成 best.pt")
     p.add_argument(
         "--val_dir",
-        default="/Users/kebiaoy/Documents/MjTrainData/check_data",
+        default="E:\\Train\\eval_data",
         help="验证集目录",
     )
     p.add_argument(
         "--ckpt_dir",
-        default="/Users/kebiaoy/Documents/MjTrainData/checkpoints",
+        default="E:\\Train\\checkpoints",
         help="checkpoint 目录（同时是 best.pt 输出目录）",
     )
     p.add_argument("--batch_size", type=int, default=512)
