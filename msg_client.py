@@ -40,6 +40,7 @@ class MsgClientApp:
         self.ws = None
         self.ui_queue: queue.Queue = queue.Queue()  # websocket -> UI
         self.online_clients: list[str] = []
+        self.selected_client: str | None = None  # 手动跟踪选中状态，不依赖 listbox 焦点
         self.connected = False
 
         self._build_ui()
@@ -75,8 +76,14 @@ class MsgClientApp:
         # 左：在线客户端
         left = ttk.LabelFrame(body, text="在线客户端", padding=4)
         body.add(left, weight=1)
-        self.listbox = tk.Listbox(left, height=20, activestyle="dotbox")
+        # activestyle=none 关掉焦点环；选中高亮完全由 _apply_selection_highlight 用 itemconfig 控制，
+        # 这样焦点被输入框抢走后选中状态仍然可见、仍然可用
+        self.listbox = tk.Listbox(
+            left, height=20, activestyle="none",
+            selectbackground="#d0e7ff", selectforeground="#000000",
+        )
         self.listbox.pack(fill=tk.BOTH, expand=True)
+        self.listbox.bind("<<ListboxSelect>>", self._on_listbox_select)
         self.listbox.bind("Double-Button-1", lambda e: self.input_entry.focus_set())
 
         # 右：消息显示 + 输入
@@ -217,11 +224,10 @@ class MsgClientApp:
         if not self.connected or self.loop is None:
             messagebox.showinfo("提示", "未连接")
             return
-        sel = self.listbox.curselection()
-        if not sel:
+        if not self.selected_client:
             messagebox.showinfo("提示", "请先在左侧选中一个在线客户端")
             return
-        to = self.online_clients[sel[0]]
+        to = self.selected_client
         content = self.input_var.get()
         if not content:
             return
@@ -249,10 +255,32 @@ class MsgClientApp:
     # ──────────────────────────────────────────────────────────
     # 工具
     # ──────────────────────────────────────────────────────────
+    def _on_listbox_select(self, _event):
+        """点击列表项时，把选中客户端记到 self.selected_client，并刷新高亮。"""
+        sel = self.listbox.curselection()
+        if sel and sel[0] < len(self.online_clients):
+            self.selected_client = self.online_clients[sel[0]]
+        self._apply_selection_highlight()
+
+    def _apply_selection_highlight(self):
+        """用 itemconfig 给选中的那一行上色，焦点被抢走也能看到。"""
+        for i in range(self.listbox.size()):
+            self.listbox.itemconfig(i, background="", foreground="")
+        if self.selected_client and self.selected_client in self.online_clients:
+            idx = self.online_clients.index(self.selected_client)
+            self.listbox.itemconfig(idx, background="#cfe8ff", foreground="#000000")
+            # 同步原生选中态，保证视觉一致（焦点回来时不会跳）
+            self.listbox.selection_clear(0, tk.END)
+            self.listbox.selection_set(idx)
+
     def _refresh_listbox(self):
         self.listbox.delete(0, tk.END)
         for n in self.online_clients:
             self.listbox.insert(tk.END, n)
+        # 选中的客户端若已下线，清掉选中态
+        if self.selected_client and self.selected_client not in self.online_clients:
+            self.selected_client = None
+        self._apply_selection_highlight()
 
     def _append_msg(self, text: str, tag: str = ""):
         self.msg_text.config(state=tk.NORMAL)
