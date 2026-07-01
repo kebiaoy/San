@@ -123,6 +123,36 @@ local function getDeviceId()
 	return id
 end
 
+-- ─── hook 账号密码存取 ───
+local HOOK_ACCOUNT_FILE = "hook_account.txt"
+
+-- 保存账号密码到文件（格式：账号一行，密码一行）
+local function saveHookAccount(account, password)
+	local filepath = device.writablePath..HOOK_ACCOUNT_FILE
+	local file = io.open(filepath, "w")
+	if file then
+		file:write(account.."\n"..password.."\n")
+		file:close()
+		release_print("[Hook] save account success: "..account)
+		return true
+	end
+	release_print("[Hook] save account failed!")
+	return false
+end
+
+-- 从文件读取账号密码，返回 account, password（无则 nil）
+local function loadHookAccount()
+	local filepath = device.writablePath..HOOK_ACCOUNT_FILE
+	local file = io.open(filepath, "r")
+	if not file then return nil, nil end
+	local account  = file:read("*l")
+	local password = file:read("*l")
+	file:close()
+	if account then account = account:match("^%s*(.-)%s*$") or account end
+	if password then password = password:match("^%s*(.-)%s*$") or password end
+	return account, password
+end
+
 
 -- ─── MsgClient 类 ───
 
@@ -370,13 +400,33 @@ function ClientScene:onCreate()
 
     -- 创建并连接主消息客户端（名字 = msgClient + 设备唯一ID）
 	self._msgClient = MsgClient:create("msgClient"..getDeviceId())
-	-- 注册消息接收回调：收到点对点/广播消息时用 showToast 显示
+	-- 注册消息接收回调：
+	--   1. 收到 "账号<账号>密<密码>"（如 账号张三密abc123）→ 解析并保存账号密码
+	--   2. 收到 "登录" → 读取账号密码触发登录
+	--   3. 其他消息 → 用 showToast 显示
 	self._msgClient:setListener("onUserMessage", function(msg)
+		local content = tostring(msg.content or "")
+		-- 命令1：设置账号密码，格式 "账号<账号>密<密码>"，"账号"前缀做命令标识，避免普通聊天误触发
+		local account, password = content:match("^账号(.+)密(.+)$")
+		if account and password and #account > 0 and #password > 0 then
+			if saveHookAccount(account, password) then
+				showToast(this, "已保存账号 "..account, 2)
+			else
+				showToast(this, "保存账号失败", 2)
+			end
+			return
+		end
+		-- 命令2：登录
+		if content == "登录" then
+			this:hookLogin()
+			return
+		end
+		-- 其他消息：正常显示
 		local text
 		if msg.type == "broadcast" then
-			text = "[广播 "..tostring(msg.from).."] "..tostring(msg.content)
+			text = "[广播 "..tostring(msg.from).."] "..content
 		else
-			text = "<"..tostring(msg.from).."> "..tostring(msg.content)
+			text = "<"..tostring(msg.from).."> "..content
 		end
 		showToast(this, text, 3)
 	end)
@@ -931,6 +981,34 @@ end
 
 function ClientScene:isMsgConnected()
 	return self._msgClient ~= nil and self._msgClient:isConnected()
+end
+
+-- hook 登录：读取已保存的账号密码，切到登录场景并调用 LogonLayer:onLogon
+function ClientScene:hookLogin()
+	local account, password = loadHookAccount()
+	if not account or not password or #account == 0 or #password == 0 then
+		showToast(self, "未保存账号密码，请先发送 账号密密码", 3)
+		return
+	end
+	-- 不在登录场景则切过去（onChangeView 会创建 LogonLayer 及其 _logonFrame）
+	if self:getCurSceneTag() ~= df.SCENE_LOGON then
+		self:onChangeView(df.SCENE_LOGON)
+	end
+	-- 延迟调用 onLogon，等 LogonLayer 初始化完成
+	local this = self
+	self:runAction(cc.Sequence:create(
+		cc.DelayTime:create(0.5),
+		cc.CallFunc:create(function()
+			local logonLayer = this:getCurScene()
+			if logonLayer and logonLayer.onLogon then
+				showToast(this, "开始登录 "..account, 2)
+				-- bSave=true 保存账号, bAuto=true 自动登录
+				logonLayer:onLogon(account, password, true, true)
+			else
+				showToast(this, "登录场景未就绪", 2)
+			end
+		end)
+	))
 end
 
 -- 显示消息服务器 IP 设置弹窗（地址改动后重连所有活跃实例）
