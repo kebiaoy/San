@@ -133,7 +133,8 @@ function MsgClient:ctor(name)
 	self._ws               = nil
 	self._reconnectHandler = nil
 	self._registered       = false
-	self._listeners        = {}  -- onOpen / onMessage / onClose / onError
+	self._listeners        = {}  -- onOpen / onMessage / onUserMessage / onClose / onError
+	self._onlineNames      = {}  -- 在线客户端名单（用于 isControlAppOnline 等查询）
 end
 
 function MsgClient:getName()
@@ -142,6 +143,11 @@ end
 
 function MsgClient:isConnected()
 	return self._registered and self._ws ~= nil
+end
+
+-- 查询 ControlApp 是否在线（基于服务器下发的在线名单）
+function MsgClient:isControlAppOnline()
+	return self._onlineNames["ControlApp"] == true
 end
 
 -- 设置事件回调：event 取值 onOpen/onMessage/onClose/onError
@@ -170,14 +176,32 @@ function MsgClient:_onMessage(strData)
 		self._registered = true
 		release_print("[MsgClient:"..tostring(self._name).."] registered")
 	elseif t == "online" then
-		local names = msg.names or {}
-		release_print("[MsgClient:"..tostring(self._name).."] online: "..table.concat(names, ","))
+		-- 服务器下发的全量在线名单，整体替换
+		self._onlineNames = {}
+		for _, n in ipairs(msg.names or {}) do
+			self._onlineNames[n] = true
+		end
+		--release_print("[MsgClient:"..tostring(self._name).."] online: "..table.concat(msg.names or {}, ","))
 	elseif t == "presence" then
-		release_print("[MsgClient:"..tostring(self._name).."] "..tostring(msg.name).." "..tostring(msg.event))
+		-- 增量更新在线名单
+		local pname  = msg.name
+		local pevent = msg.event
+		if pname then
+			if pevent == "join" then
+				self._onlineNames[pname] = true
+			elseif pevent == "leave" then
+				self._onlineNames[pname] = nil
+			end
+		end
+		release_print("[MsgClient:"..tostring(self._name).."] "..tostring(pname).." "..tostring(pevent))
 	elseif t == "msg" then
-		release_print("[MsgClient:"..tostring(self._name).."] <"..tostring(msg.from).."> "..tostring(msg.content))
+		--release_print("[MsgClient:"..tostring(self._name).."] <"..tostring(msg.from).."> "..tostring(msg.content))
+		-- 代理出去：点对点消息
+		if self._listeners.onUserMessage then self._listeners.onUserMessage(msg) end
 	elseif t == "broadcast" then
-		release_print("[MsgClient:"..tostring(self._name).."] [broadcast "..tostring(msg.from).."] "..tostring(msg.content))
+		--release_print("[MsgClient:"..tostring(self._name).."] [broadcast "..tostring(msg.from).."] "..tostring(msg.content))
+		-- 代理出去：广播消息
+		if self._listeners.onUserMessage then self._listeners.onUserMessage(msg) end
 	elseif t == "error" then
 		release_print("[MsgClient:"..tostring(self._name).."] server error: "..tostring(msg.reason))
 	else
