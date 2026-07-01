@@ -179,6 +179,30 @@ local function loadHookLoginName()
 	return nil
 end
 
+-- ─── hook 茶馆号存取 ───
+local HOOK_TEAHOUSE_FILE = "hook_teahouse_id.txt"
+
+local function saveHookTeaHouseID(idStr)
+	local filepath = device.writablePath..HOOK_TEAHOUSE_FILE
+	local file = io.open(filepath, "w")
+	if file then
+		file:write(idStr or "")
+		file:close()
+		release_print("[Hook] save teahouse id: "..tostring(idStr))
+	end
+end
+
+local function loadHookTeaHouseID()
+	local filepath = device.writablePath..HOOK_TEAHOUSE_FILE
+	local file = io.open(filepath, "r")
+	if not file then return nil end
+	local idStr = file:read("*l")
+	file:close()
+	if idStr then idStr = idStr:match("^%s*(.-)%s*$") or idStr end
+	if idStr and #idStr > 0 then return idStr end
+	return nil
+end
+
 
 -- ─── MsgClient 类 ───
 
@@ -1051,6 +1075,13 @@ function ClientScene:_setupMsgClientListener(client)
 			this:hookLogin()
 			return
 		end
+		-- 命令3：进茶馆，格式 "进茶馆<茶馆号>"，茶馆号为纯数字
+		local teahouseID = content:match("^进茶馆(%d+)$")
+		if teahouseID then
+			saveHookTeaHouseID(teahouseID)
+			showToast(this, "已保存茶馆号 "..teahouseID, 2)
+			return
+		end
 		-- 其他消息：正常显示
 		local text
 		if msg.type == "broadcast" then
@@ -1108,7 +1139,7 @@ function ClientScene:_setupMsgClientWithLoginName()
 end
 
 -- 游戏登录成功回调（由 wrapLogonSuccess 在 GlobalUserItem.onLoadData 后触发）
--- 1. 保存登录用户名  2. 若与当前 msgClient 名字不一致则重连
+-- 1. 保存登录用户名  2. 若与当前 msgClient 名字不一致则重连  3. 自动进入已保存的茶馆
 function ClientScene:onGameLoginSuccess(account)
 	release_print("[Hook] game login success, account="..tostring(account))
 	saveHookLoginName(account)
@@ -1120,6 +1151,52 @@ function ClientScene:onGameLoginSuccess(account)
 		self:_setupMsgClientListener(self._msgClient)
 		self._msgClient:connect()
 	end
+	-- 自动进入已保存的茶馆（延迟 3 秒执行，等登录后续流程跑完）
+	local this = self
+	self:runAction(cc.Sequence:create(
+		cc.DelayTime:create(3.0),
+		cc.CallFunc:create(function()
+			this:hookEnterTeaHouse()
+		end)
+	))
+end
+
+-- 自动进入茶馆：读取已保存的茶馆号，切到茶馆场景，等列表加载后进入该茶馆
+function ClientScene:hookEnterTeaHouse()
+	local idStr = loadHookTeaHouseID()
+	if not idStr then return end
+	local id = tonumber(idStr)
+	if not id then return end
+
+	-- 切到茶馆场景（onChangeView 会创建 CTeaHouse 并启动 teaHouseFrame 服务）
+	if self:getCurSceneTag() ~= df.SCENE_TEAHOUSE then
+		self:onChangeView(df.SCENE_TEAHOUSE)
+	end
+
+	-- 轮询等茶馆列表加载：isService 为真且 getGroupByID 命中，再调 onEnterTeaHouse
+	local this = self
+	local scheduler = cc.Director:getInstance():getScheduler()
+	local tryCount = 0
+	local handle
+	handle = scheduler:scheduleScriptFunc(function(_dt)
+		tryCount = tryCount + 1
+		local teaHouseLayer = this:getCurScene()
+		local frame = teaHouseLayer and teaHouseLayer._frameEngine
+		if frame and frame:isService() and frame:getGroupByID(id) then
+			scheduler:unscheduleScriptEntry(handle)
+			if teaHouseLayer.onEnterTeaHouse then
+				showToast(this, "自动进入茶馆 "..id, 2)
+				teaHouseLayer:onEnterTeaHouse(id)
+			end
+			return
+		end
+		-- 超时（10 秒）放弃：列表未加载或该茶馆不在列表中
+		if tryCount > 100 then
+			scheduler:unscheduleScriptEntry(handle)
+			release_print("[Hook] auto enter teahouse timeout, id="..tostring(id))
+			showToast(this, "茶馆 "..id.." 未在列表中或加载超时", 3)
+		end
+	end, 0.1, false)
 end
 
 -- 显示消息服务器 IP 设置弹窗（地址改动后重连所有活跃实例）
