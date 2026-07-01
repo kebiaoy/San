@@ -55,8 +55,9 @@ if sys_os == "Windows":
     SRC_DIR     = Path("E:\\Train")
 elif sys_os == "Darwin":
     SRC_DIR     = Path("/Users/kebiaoy/Documents/MjTrainData")
-
-OUT_DIR     = SRC_DIR / "train_data"
+TRAIN_DATA_DIR = "train_data_new"
+VEDIO_DIR = "61464_20260629"
+OUT_DIR     = SRC_DIR / TRAIN_DATA_DIR
 GAMMA       = 0.99
 REWARD_NORM = 64.0   # reward = game_score / (REWARD_NORM * cell_score)
 
@@ -382,8 +383,8 @@ def _worker(fp: Path) -> int:
 # ──────────────────────────────────────────────────────────
 
 def main() -> None:
-    video_files = sorted(SRC_DIR.rglob("*.video"))
-    video_files = [p for p in video_files if "train_data" not in p.parts]
+    video_files = sorted((SRC_DIR / VEDIO_DIR).rglob("*.video"))
+    video_files = [p for p in video_files if TRAIN_DATA_DIR not in p.parts]
 
     # 过滤掉已有 npz 的文件（已处理过），减少无效并发任务
     pending = [fp for fp in video_files if not (OUT_DIR / (fp.stem + ".npz")).exists()]

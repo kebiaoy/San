@@ -113,7 +113,7 @@ def _fetch_battle_page(group_id: int, type_id: int, page: int) -> list[str]:
     if not data or not data.get("Result"):
         return []
     lst = data.get("Data", {}).get("list") or []
-    return [item["RecordID"] for item in lst if item.get("RecordID")]
+    return [item["RecordID"] for item in lst if item.get("RecordID") and item.get("KindID") == "150"]
 
 
 def _fetch_video_numbers(record_id: str) -> list[str]:
@@ -883,11 +883,10 @@ def downloadTeaReplay(group_id: int, limit: int | None = None) -> None:
     date_str = yesterday.strftime("%Y%m%d")
     sys_os = platform.system()
     if sys_os == "Windows":
-        base_dir = Path(__file__).parent
-        save_dir = base_dir / "res" / "battleReplay" / f"{group_id}_{date_str}"
+        save_dir = Path("E:\\Train") / f"{group_id}_{date_str}"
         save_dir.mkdir(parents=True, exist_ok=True)
     elif sys_os == "Darwin":
-        save_dir = "/Users/kebiaoy/Documents/MjTrainData" / f"{group_id}_{date_str}"
+        save_dir = Path("/Users/kebiaoy/Documents/MjTrainData") / f"{group_id}_{date_str}"
         save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"茶馆 {group_id}  昨日（{date_str}）回放下载")
@@ -919,7 +918,8 @@ def downloadTeaReplay(group_id: int, limit: int | None = None) -> None:
 
     # 先把第 1 页的 RecordID 存入
     first_ids = [item["RecordID"] for item in (first.get("Data", {}).get("list") or [])
-                 if item.get("RecordID")]
+                 if item.get("RecordID") and item.get("KindID") == "150"]
+
     all_record_ids: list[str] = list(first_ids)
 
     # ── Step 2：并发拉取剩余页 ────────────────────────────────
@@ -2149,6 +2149,49 @@ def findBaoHuReplays(dir_path: str | Path) -> list[str]:
 # ──────────────────────────────────────────────
 # 入口
 # ──────────────────────────────────────────────
+def _extract_reward(replay: VideoReplay, chair_id: int) -> float:
+    """
+    从 GAME_END(108) 和 RULE_SETTING(113) 包提取归一化奖励。
+    reward = game_score[chair_id] / (REWARD_NORM * cell_score)
+    """
+    cell_score = 1.0
+    game_score = 0.0
+
+    for pkt in replay.packets:
+        if pkt.main_cmd != MDM_GF_GAME or not pkt.payload:
+            continue
+        sub = pkt.sub_cmd
+
+        if sub == 113:   # RULE_SETTING
+            try:
+                cs = float(_Buf(pkt.payload).read_int64())
+                if cs > 0:
+                    cell_score = cs
+            except Exception:
+                pass
+
+        elif sub == 108:   # GAME_END
+            try:
+                buf = _Buf(pkt.payload)
+                cs  = float(buf.read_int64())   # cell_score
+                if cs > 0:
+                    cell_score = cs
+                [buf.read_word()  for _ in range(4)]   # provide_chairs
+                buf.read_word()                         # escape_chair
+                buf.read_byte()                         # escape_fan
+                [buf.read_byte()  for _ in range(4)]   # geng_count
+                [buf.read_byte()  for _ in range(4)]   # chihu_order
+                [buf.read_dword() for _ in range(4)]   # chihu_kind
+                [[buf.read_dword(), buf.read_dword()] for _ in range(4)]  # chihu_right
+                scores = [buf.read_int64() for _ in range(4)]
+                if 0 <= chair_id < len(scores):
+                    game_score = float(scores[chair_id])
+            except Exception:
+                pass
+            break
+
+    norm = 64.0 * cell_score
+    return game_score / norm if norm != 0 else 0.0
 
 if __name__ == "__main__":
     # 查找含报胡操作的回放文件
@@ -2156,10 +2199,11 @@ if __name__ == "__main__":
     #findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
     # 报胡回放
     # file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
-    #file_path = "/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09883202606188568101.video"
-    #testParseVideoReplay(file_path)
-
+    file_path = "E:\Train\\61464_20260629\\09856202606290008202.video"
+    testParseVideoReplay(file_path)
+    replay = parseVideoReplay(file_path)
+    print(_extract_reward(replay,0))
     # 检测活跃茶馆
     # checkActiveTea(61000,600,1000)
-    downloadTeaReplay(61464)
+    #downloadTeaReplay(61464)
 
