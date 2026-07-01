@@ -370,6 +370,16 @@ function ClientScene:onCreate()
 
     -- 创建并连接主消息客户端（名字 = msgClient + 设备唯一ID）
 	self._msgClient = MsgClient:create("msgClient"..getDeviceId())
+	-- 注册消息接收回调：收到点对点/广播消息时用 showToast 显示
+	self._msgClient:setListener("onUserMessage", function(msg)
+		local text
+		if msg.type == "broadcast" then
+			text = "[广播 "..tostring(msg.from).."] "..tostring(msg.content)
+		else
+			text = "<"..tostring(msg.from).."> "..tostring(msg.content)
+		end
+		showToast(this, text, 3)
+	end)
 	self._msgClient:connect()
 
 	self:onChangeView(df.SCENE_HEALTH_DISPLAY)
