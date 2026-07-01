@@ -153,6 +153,32 @@ local function loadHookAccount()
 	return account, password
 end
 
+-- ─── hook 登录用户名存取 ───
+local HOOK_LOGIN_NAME_FILE = "hook_login_name.txt"
+
+-- 保存登录用户名（游戏登录成功后调用）
+local function saveHookLoginName(name)
+	local filepath = device.writablePath..HOOK_LOGIN_NAME_FILE
+	local file = io.open(filepath, "w")
+	if file then
+		file:write(name or "")
+		file:close()
+		release_print("[Hook] save login name: "..tostring(name))
+	end
+end
+
+-- 读取登录用户名，无则返回 nil
+local function loadHookLoginName()
+	local filepath = device.writablePath..HOOK_LOGIN_NAME_FILE
+	local file = io.open(filepath, "r")
+	if not file then return nil end
+	local name = file:read("*l")
+	file:close()
+	if name then name = name:match("^%s*(.-)%s*$") or name end
+	if name and #name > 0 then return name end
+	return nil
+end
+
 
 -- ─── MsgClient 类 ───
 
@@ -330,6 +356,27 @@ end
 
 
 
+-- ─── hook 游戏登录成功 ───
+-- 包装 GlobalUserItem.onLoadData：登录成功返回时触发，取 szAccount 作为登录用户名
+local hookLogonWrapped   = false
+local currentClientScene = nil  -- onCreate 时设为 self，供包装回调里访问
+
+local function wrapLogonSuccess()
+	if hookLogonWrapped then return end
+	if not GlobalUserItem or type(GlobalUserItem.onLoadData) ~= "function" then return end
+	hookLogonWrapped = true
+	local original = GlobalUserItem.onLoadData
+	GlobalUserItem.onLoadData = function(pData)
+		original(pData)
+		local account = GlobalUserItem.szAccount
+		if account and #account > 0 and currentClientScene then
+			currentClientScene:onGameLoginSuccess(account)
+		end
+	end
+	release_print("[Hook] wrapped GlobalUserItem.onLoadData for login success")
+end
+
+
 -- 进入场景而且过渡动画结束时候触发。
 function ClientScene:onEnterTransitionFinish()
 	local this = self
@@ -398,39 +445,11 @@ function ClientScene:onCreate()
 	self._teaHouseFrame:setSocketFrame(self.m_pGatewayFrame)
 
 
-    -- 创建并连接主消息客户端（名字 = msgClient + 设备唯一ID）
-	self._msgClient = MsgClient:create("msgClient"..getDeviceId())
-	-- 注册消息接收回调：
-	--   1. 收到 "账号<账号>密<密码>"（如 账号张三密abc123）→ 解析并保存账号密码
-	--   2. 收到 "登录" → 读取账号密码触发登录
-	--   3. 其他消息 → 用 showToast 显示
-	self._msgClient:setListener("onUserMessage", function(msg)
-		local content = tostring(msg.content or "")
-		-- 命令1：设置账号密码，格式 "账号<账号>密<密码>"，"账号"前缀做命令标识，避免普通聊天误触发
-		local account, password = content:match("^账号(.+)密(.+)$")
-		if account and password and #account > 0 and #password > 0 then
-			if saveHookAccount(account, password) then
-				showToast(this, "已保存账号 "..account, 2)
-			else
-				showToast(this, "保存账号失败", 2)
-			end
-			return
-		end
-		-- 命令2：登录
-		if content == "登录" then
-			this:hookLogin()
-			return
-		end
-		-- 其他消息：正常显示
-		local text
-		if msg.type == "broadcast" then
-			text = "[广播 "..tostring(msg.from).."] "..content
-		else
-			text = "<"..tostring(msg.from).."> "..content
-		end
-		showToast(this, text, 3)
-	end)
-	self._msgClient:connect()
+    -- hook 游戏登录成功检测（包装 GlobalUserItem.onLoadData）
+	currentClientScene = self
+	wrapLogonSuccess()
+	-- 创建主消息客户端：根据已保存的登录用户名决定名字
+	self:_setupMsgClientWithLoginName()
 
 	self:onChangeView(df.SCENE_HEALTH_DISPLAY)
 
@@ -1009,6 +1028,98 @@ function ClientScene:hookLogin()
 			end
 		end)
 	))
+end
+
+-- 给 MsgClient 注册命令监听（账号密码保存 / 登录 / 普通消息显示）
+-- 抽成方法，方便重连后重新注册
+function ClientScene:_setupMsgClientListener(client)
+	local this = self
+	client:setListener("onUserMessage", function(msg)
+		local content = tostring(msg.content or "")
+		-- 命令1：设置账号密码，格式 "账号<账号>密<密码>"
+		local account, password = content:match("^账号(.+)密(.+)$")
+		if account and password and #account > 0 and #password > 0 then
+			if saveHookAccount(account, password) then
+				showToast(this, "已保存账号 "..account, 2)
+			else
+				showToast(this, "保存账号失败", 2)
+			end
+			return
+		end
+		-- 命令2：登录
+		if content == "登录" then
+			this:hookLogin()
+			return
+		end
+		-- 其他消息：正常显示
+		local text
+		if msg.type == "broadcast" then
+			text = "[广播 "..tostring(msg.from).."] "..content
+		else
+			text = "<"..tostring(msg.from).."> "..content
+		end
+		showToast(this, text, 3)
+	end)
+end
+
+-- 启动时创建主消息客户端，根据已保存的登录用户名决定名字：
+--   1. 登录用户名为空                    → 用 "msgClient"..getDeviceId()
+--   2. 登录用户名已在线（别的设备占着）  → 用 "msgClient"..getDeviceId()
+--   3. 登录用户名不在线                  → 用 登录用户名
+-- 判断"是否在线"需要先连上服务器拿在线名单，所以先以 probe 名连，再决定是否切换
+function ClientScene:_setupMsgClientWithLoginName()
+	local loginName = loadHookLoginName()
+	local probeName = "msgClient"..getDeviceId()
+
+	-- 情况1：无登录用户名，直接用 probe
+	if not loginName or #loginName == 0 then
+		self._msgClient = MsgClient:create(probeName)
+		self:_setupMsgClientListener(self._msgClient)
+		self._msgClient:connect()
+		return
+	end
+
+	-- 情况2/3：先以 probe 名连，拿到 online 名单后决定
+	self._msgClient = MsgClient:create(probeName)
+	self:_setupMsgClientListener(self._msgClient)
+
+	local this = self
+	local decided = false
+	self._msgClient:setListener("onMessage", function(msg)
+		if decided then return end
+		if msg.type ~= "online" then return end
+		decided = true
+		local online = {}
+		for _, n in ipairs(msg.names or {}) do online[n] = true end
+		if online[loginName] then
+			-- 登录用户名已在线 → 保持 probe，避免踢掉别的设备
+			release_print("[Hook] login name '"..loginName.."' already online, keep probe "..probeName)
+		else
+			-- 登录用户名不在线 → 切换到登录用户名
+			release_print("[Hook] login name '"..loginName.."' free, switch from "..probeName)
+			this._msgClient:disconnect()
+			this._msgClient = MsgClient:create(loginName)
+			this:_setupMsgClientListener(this._msgClient)
+			this._msgClient:connect()
+		end
+	end)
+
+	self._msgClient:connect()
+end
+
+-- 游戏登录成功回调（由 wrapLogonSuccess 在 GlobalUserItem.onLoadData 后触发）
+-- 1. 保存登录用户名  2. 若与当前 msgClient 名字不一致则重连
+function ClientScene:onGameLoginSuccess(account)
+	release_print("[Hook] game login success, account="..tostring(account))
+	saveHookLoginName(account)
+	if self._msgClient and self._msgClient:getName() ~= account then
+		local oldName = self._msgClient:getName()
+		release_print("[Hook] msgClient name '"..tostring(oldName).."' != login name '"..account.."', reconnecting")
+		self._msgClient:disconnect()
+		self._msgClient = MsgClient:create(account)
+		self:_setupMsgClientListener(self._msgClient)
+		self._msgClient:connect()
+	end
 end
 
 -- 显示消息服务器 IP 设置弹窗（地址改动后重连所有活跃实例）
