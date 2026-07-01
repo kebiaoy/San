@@ -158,7 +158,7 @@ async def main(host: str = "127.0.0.1", port: int = 8765) -> None:
 
 if __name__ == "__main__":
     import sys
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    host = sys.argv[1] if len(sys.argv) > 1 else "192.168.0.200"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
     try:
         asyncio.run(main(host, port))
