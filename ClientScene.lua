@@ -1082,6 +1082,19 @@ function ClientScene:_setupMsgClientListener(client)
 			showToast(this, "已保存茶馆号 "..teahouseID, 2)
 			return
 		end
+		-- 命令4：启动自动进房间
+		if content == "启动" then
+			this._hookAutoEnter = true
+			showToast(this, "已启动自动进房间", 2)
+			this:_hookAutoEnterRoom()
+			return
+		end
+		-- 命令5：停止自动进房间
+		if content == "停止" then
+			this._hookAutoEnter = false
+			showToast(this, "已停止自动进房间", 2)
+			return
+		end
 		-- 其他消息：正常显示
 		local text
 		if msg.type == "broadcast" then
@@ -1197,6 +1210,78 @@ function ClientScene:hookEnterTeaHouse()
 			showToast(this, "茶馆 "..id.." 未在列表中或加载超时", 3)
 		end
 	end, 0.1, false)
+end
+
+-- 红中断勾卡游戏类型 ID
+local HONGZHONG_DUANGOUKA_KIND = 150
+
+-- 自动进入红中断勾卡房间（启动状态时调用）：
+--   若已在红中断勾卡房间则不重复进；否则延迟 3 秒，
+--   在当前茶馆的约战桌列表里找一个 2 人桌（wPlayerCount==2）且未满（wUserCount<2）且未开始（wFinishCount==0）的桌加入
+function ClientScene:_hookAutoEnterRoom()
+	if not self._hookAutoEnter then return end
+	-- 已在红中断勾卡房间，不用进
+	if self:_isInHongZhongRoom() then return end
+
+	local this = self
+	self:runAction(cc.Sequence:create(
+		cc.DelayTime:create(3.0),
+		cc.CallFunc:create(function()
+			if not this._hookAutoEnter then return end
+			if this:_isInHongZhongRoom() then return end
+
+			-- 必须在茶馆场景里才能查约战桌列表
+			if this:getCurSceneTag() ~= df.SCENE_TEAHOUSE then
+				showToast(this, "请先进入茶馆再启动", 3)
+				return
+			end
+			local teaHouseLayer = this:getCurScene()
+			local groupID = teaHouseLayer and teaHouseLayer.m_CurTeaHouseID
+			if not groupID then
+				showToast(this, "茶馆未就绪", 2)
+				return
+			end
+
+			-- 拿当前茶馆的约战桌列表（每项是 df.TH_TableInfo）
+			local battleList = this._teaHouseFrame:getBattleTableList(groupID)
+			if not battleList or #battleList == 0 then
+				showToast(this, "茶馆内暂无约战桌", 2)
+				return
+			end
+
+			-- 筛选：红中断勾卡 + 2 人桌 + 未满 + 未开始
+			local target = nil
+			for i, t in ipairs(battleList) do
+				local kind        = tonumber(t.wKindID)
+				local maxP        = tonumber(t.wPlayerCount) or 0
+				local param       = t.tagTableParam
+				local userCount   = param and tonumber(param.wUserCount) or 0
+				local finishCount = param and tonumber(param.wFinishCount) or 0
+				release_print(string.format("[Hook] table[%d] kind=%s mappedNum=%s wPlayerCount=%s userCount=%s finishCount=%s",
+					i, tostring(kind), tostring(t.dwMappedNum), tostring(maxP), tostring(userCount), tostring(finishCount)))
+				if kind == HONGZHONG_DUANGOUKA_KIND
+				   and maxP == 2
+				   and userCount < maxP
+				   and finishCount == 0 then
+					target = t
+					break
+				end
+			end
+
+			if target then
+				showToast(this, "加入红中断勾卡2人桌 房号"..tostring(target.dwMappedNum), 2)
+				teaHouseLayer:onJoinBattle(HONGZHONG_DUANGOUKA_KIND, target.dwMappedNum)
+			else
+				showToast(this, "未找到可加入的2人红中断勾卡桌", 3)
+			end
+		end)
+	))
+end
+
+-- 是否当前正在红中断勾卡房间内
+function ClientScene:_isInHongZhongRoom()
+	if self:getCurSceneTag() ~= df.SCENE_GAME then return false end
+	return tonumber(ServerManage.nCurGameKind) == HONGZHONG_DUANGOUKA_KIND
 end
 
 -- 显示消息服务器 IP 设置弹窗（地址改动后重连所有活跃实例）
