@@ -1325,12 +1325,23 @@ end
 -- ─── 游戏指令转发 hook（不修改游戏逻辑文件，全部在 ClientScene 里包装）───
 -- 包装 GameClientEngine.onEventGameMessage：
 --   1. 每条游戏消息解析后，把 action 字段存入 gameEngine._hookInstructions 列表
---   2. 在需要用户操作的事件（sub=100 发送手牌 / sub=104 杠碰胡请胡 / sub=115 报胡）时，
+--   2. 参照 scyxjy.py 的 generalChairTrainData 判断逻辑，只在能生成训练样本的决策点
 --      把整套指令列表发给 ControlApp（由 msg_client.py 用 ReplayBuilder 组装 replay）
+--      决策点（以 myChair 为第一视角）：
+--        sub=100 case_a: 无报胡阶段 + 我是庄家
+--        sub=100 case_c(首位): 首个报胡决策轮到我
+--        sub=115 case_c: 报胡决策轮到我
+--        sub=115 case_b/d/e: 报胡阶段全部结束
+--        sub=102 case_f: 摸牌轮到我（已报胡时仅可胡/可杠才转发）
+--        sub=104 case_g: 操作提示轮到我（杠/碰/胡/请胡）
+local HOOK_INVALID_CHAIR = 0xFFFF
+local HOOK_HU_GANG_MASK  = 0x04 + 0x08 + 0x40 + 0x80  -- 杠|加杠|吃胡|点炮
+
 function ClientScene:_hookGameEngineForInstructions(gameEngine)
 	if gameEngine == nil or gameEngine._hookInstrWrapped then return end
 	gameEngine._hookInstrWrapped = true
 	gameEngine._hookInstructions = {}
+	gameEngine._hookState = {}  -- 追踪游戏状态：bankerChair/baoChairFirst/baoPhaseActive/baoHuSelf/...
 
 	local this = self
 	local orig = gameEngine.onEventGameMessage
@@ -1338,21 +1349,95 @@ function ClientScene:_hookGameEngineForInstructions(gameEngine)
 
 	gameEngine.onEventGameMessage = function(gself, sub, dataBuffer)
 		orig(gself, sub, dataBuffer)
-		-- sub=100 是新一局开始，清空指令列表
+		-- sub=100 新一局：清空指令列表 + 重置状态
 		if sub == 100 then
 			gself._hookInstructions = {}
+			gself._hookState = {}
 		end
 		-- 保存本条指令
 		local fields = this:_extractInstrFields(sub, gself)
 		if fields then
 			table.insert(gself._hookInstructions, { sub = sub, fields = fields })
 		end
-		-- 触发事件：整套转发给 ControlApp
-		if sub == 100 or sub == 104 or sub == 115 then
+		-- 判断是否为训练样本生成点（参照 generalChairTrainData），是则整套转发
+		if this:_shouldForwardForTrain(sub, fields, gself) then
 			this:_forwardInstructionsToControlApp(gself._hookInstructions)
 		end
 	end
 	release_print("[Hook] game engine instruction forward hooked")
+end
+
+-- 判断当前消息是否对应 generalChairTrainData 的训练样本生成点
+-- 参照 scyxjy.py:generalChairTrainData 的 case_a ~ case_g 条件
+function ClientScene:_shouldForwardForTrain(sub, fields, gameEngine)
+	if not fields then return false end
+	local state = gameEngine._hookState
+	if not state then return false end
+	local myChair = gameEngine.getMeChairID and gameEngine:getMeChairID() or 0
+
+	if sub == 100 then  -- GAME_START
+		state.myChair         = myChair
+		state.bankerChair     = fields.banker_chair
+		state.baoChairFirst   = fields.bao_chair
+		state.baoPhaseActive  = (fields.bao_chair ~= HOOK_INVALID_CHAIR)
+		state.baoHuSelf       = false
+		state.selfBaoHuiTurn  = false
+		state.selfChoseBaoHu  = false
+		state.gameStarted     = true
+		-- case_a: 无报胡阶段 + 我是庄家 → 庄家直接出牌
+		if not state.baoPhaseActive and myChair == state.bankerChair then
+			return true
+		end
+		-- case_c (首位): 首个报胡决策轮到我
+		if state.baoPhaseActive and state.baoChairFirst == myChair then
+			return true
+		end
+		return false
+
+	elseif sub == 115 then  -- BAO_HU_NOTIFY
+		if not state.gameStarted or not state.baoPhaseActive then return false end
+		local curChair = fields.current_chair
+		local lastChair = fields.last_chair
+		local baoFlag = fields.bao_flag
+		-- 记录自己的报胡决策
+		if lastChair == myChair then
+			state.selfBaoHuiTurn = true
+			state.selfChoseBaoHu = (baoFlag == 1)
+			if baoFlag == 1 then state.baoHuSelf = true end
+		end
+		-- case_c (后续): 报胡决策轮到我
+		if curChair == myChair then
+			return true
+		end
+		-- case_b/d/e: 报胡阶段全部结束（current_chair == INVALID_CHAIR）
+		if curChair == HOOK_INVALID_CHAIR then
+			return true
+		end
+		return false
+
+	elseif sub == 102 then  -- SEND_CARD (摸牌)
+		if not state.gameStarted then return false end
+		if fields.current_chair ~= myChair then return false end
+		-- case_f: 摸牌轮到我
+		-- 已报胡时：报胡后出牌由系统托管，只有可胡/可杠时才生成决策样本
+		if state.baoHuSelf then
+			local mask = tonumber(fields.action_mask) or 0
+			if bit and bit._and and bit:_and(mask, HOOK_HU_GANG_MASK) ~= 0 then
+				return true
+			end
+			return false
+		end
+		return true
+
+	elseif sub == 104 then  -- OPERATE_NOTIFY
+		if not state.gameStarted then return false end
+		-- case_g: 操作提示（杠/碰/胡/请胡）轮到我
+		if fields.resume_chair == myChair then
+			return true
+		end
+		return false
+	end
+	return false
 end
 
 -- 从 gameEngine._actionList 最后一项提取指令字段（按 sub 类型）
