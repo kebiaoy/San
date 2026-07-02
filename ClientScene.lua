@@ -1323,52 +1323,64 @@ function ClientScene:_isInHongZhongRoom()
 end
 
 -- ─── 游戏指令转发 hook（不修改游戏逻辑文件，全部在 ClientScene 里包装）───
--- 包装 GameClientEngine.onEventGameMessage：
---   1. 每条游戏消息解析后，把 action 字段存入 gameEngine._hookInstructions 列表
---   2. 参照 scyxjy.py 的 generalChairTrainData 判断逻辑，只在能生成训练样本的决策点
---      把整套指令列表发给 ControlApp（由 msg_client.py 用 ReplayBuilder 组装 replay）
---      决策点（以 myChair 为第一视角）：
---        sub=100 case_a: 无报胡阶段 + 我是庄家
---        sub=100 case_c(首位): 首个报胡决策轮到我
---        sub=115 case_c: 报胡决策轮到我
---        sub=115 case_b/d/e: 报胡阶段全部结束
---        sub=102 case_f: 摸牌轮到我（已报胡时仅可胡/可杠才转发）
---        sub=104 case_g: 操作提示轮到我（杠/碰/胡/请胡）
+-- 包装 GameClientEngine.removeGameAction：在 action 被移除前捕获它
+--   （onSubXXX 把 action append 到 _actionList 后调 beginGameAction → startXxx → removeGameAction，
+--    removeGameAction 用 table.remove(_actionList,1) 移除。所以 onEventGameMessage 包装里
+--    读 _actionList[#] 时 action 可能已被移除，sub=105 等会丢失。改在 removeGameAction 捕获最可靠）
+--   1. 每条 action 被处理完移除时，按 nKind 映射 sub，提取字段存入 _hookInstructions
+--   2. 参照 scyxjy.py 的 generalChairTrainData 判断 + 碰/杠后出牌决策，在决策点整套转发给 ControlApp
 local HOOK_INVALID_CHAIR = 0xFFFF
 local HOOK_HU_GANG_MASK  = 0x04 + 0x08 + 0x40 + 0x80  -- 杠|加杠|吃胡|点炮
+local HOOK_WIK_PENG       = 0x02
+
+-- nKind → sub 映射（GameClientEngine.AK_* 常量）
+local HOOK_NKIND_TO_SUB = {
+	[2]  = 100,  -- AK_GameStart
+	[7]  = 101,  -- AK_OutCard
+	[8]  = 102,  -- AK_SendCard
+	[9]  = 104,  -- AK_OP_Notify
+	[10] = 105,  -- AK_OP_Result
+	[12] = 115,  -- AK_BH_Notify
+	[13] = 107,  -- AK_CH_Result
+	[14] = 108,  -- AK_GameEnd
+}
 
 function ClientScene:_hookGameEngineForInstructions(gameEngine)
 	if gameEngine == nil or gameEngine._hookInstrWrapped then return end
 	gameEngine._hookInstrWrapped = true
 	gameEngine._hookInstructions = {}
-	gameEngine._hookState = {}  -- 追踪游戏状态：bankerChair/baoChairFirst/baoPhaseActive/baoHuSelf/...
+	gameEngine._hookState = {}
 
 	local this = self
-	local orig = gameEngine.onEventGameMessage
-	if type(orig) ~= "function" then return end
+	local origRemove = gameEngine.removeGameAction
+	if type(origRemove) ~= "function" then return end
 
-	gameEngine.onEventGameMessage = function(gself, sub, dataBuffer)
-		orig(gself, sub, dataBuffer)
-		-- sub=100 新一局：清空指令列表 + 重置状态
-		if sub == 100 then
-			gself._hookInstructions = {}
-			gself._hookState = {}
+	gameEngine.removeGameAction = function(gself, bNext)
+		-- 在 action 被移除前捕获
+		local action = gself._actionList and gself._actionList[1]
+		if action and action.bLock then
+			local sub = HOOK_NKIND_TO_SUB[action.nKind]
+			if sub then
+				-- sub=100 新一局：清空指令列表 + 重置状态
+				if sub == 100 then
+					gself._hookInstructions = {}
+					gself._hookState = {}
+				end
+				local fields = this:_actionToFields(sub, action, gself)
+				if fields then
+					table.insert(gself._hookInstructions, { sub = sub, fields = fields })
+					if this:_shouldForwardForTrain(sub, fields, gself) then
+						this:_forwardInstructionsToControlApp(gself._hookInstructions)
+					end
+				end
+			end
 		end
-		-- 保存本条指令
-		local fields = this:_extractInstrFields(sub, gself)
-		if fields then
-			table.insert(gself._hookInstructions, { sub = sub, fields = fields })
-		end
-		-- 判断是否为训练样本生成点（参照 generalChairTrainData），是则整套转发
-		if this:_shouldForwardForTrain(sub, fields, gself) then
-			this:_forwardInstructionsToControlApp(gself._hookInstructions)
-		end
+		origRemove(gself, bNext)
 	end
-	release_print("[Hook] game engine instruction forward hooked")
+	release_print("[Hook] game engine instruction forward hooked (via removeGameAction)")
 end
 
--- 判断当前消息是否对应 generalChairTrainData 的训练样本生成点
--- 参照 scyxjy.py:generalChairTrainData 的 case_a ~ case_g 条件
+-- 判断是否为决策点（参照 scyxjy.py:generalChairTrainData + 碰/杠后出牌）
 function ClientScene:_shouldForwardForTrain(sub, fields, gameEngine)
 	if not fields then return false end
 	local state = gameEngine._hookState
@@ -1376,75 +1388,63 @@ function ClientScene:_shouldForwardForTrain(sub, fields, gameEngine)
 	local myChair = gameEngine.getMeChairID and gameEngine:getMeChairID() or 0
 
 	if sub == 100 then  -- GAME_START
-		state.myChair         = myChair
-		state.bankerChair     = fields.banker_chair
-		state.baoChairFirst   = fields.bao_chair
-		state.baoPhaseActive  = (fields.bao_chair ~= HOOK_INVALID_CHAIR)
-		state.baoHuSelf       = false
-		state.selfBaoHuiTurn  = false
-		state.selfChoseBaoHu  = false
-		state.gameStarted     = true
-		-- case_a: 无报胡阶段 + 我是庄家 → 庄家直接出牌
-		if not state.baoPhaseActive and myChair == state.bankerChair then
-			return true
-		end
+		state.myChair        = myChair
+		state.bankerChair    = fields.banker_chair
+		state.baoChairFirst  = fields.bao_chair
+		state.baoPhaseActive = (fields.bao_chair ~= HOOK_INVALID_CHAIR)
+		state.baoHuSelf      = false
+		state.gameStarted    = true
+		-- case_a: 无报胡阶段 + 我是庄家
+		if not state.baoPhaseActive and myChair == state.bankerChair then return true end
 		-- case_c (首位): 首个报胡决策轮到我
-		if state.baoPhaseActive and state.baoChairFirst == myChair then
-			return true
-		end
+		if state.baoPhaseActive and state.baoChairFirst == myChair then return true end
 		return false
 
 	elseif sub == 115 then  -- BAO_HU_NOTIFY
 		if not state.gameStarted or not state.baoPhaseActive then return false end
-		local curChair = fields.current_chair
+		local curChair  = fields.current_chair
 		local lastChair = fields.last_chair
-		local baoFlag = fields.bao_flag
-		-- 记录自己的报胡决策
-		if lastChair == myChair then
-			state.selfBaoHuiTurn = true
-			state.selfChoseBaoHu = (baoFlag == 1)
-			if baoFlag == 1 then state.baoHuSelf = true end
-		end
-		-- case_c (后续): 报胡决策轮到我
-		if curChair == myChair then
-			return true
-		end
-		-- case_b/d/e: 报胡阶段全部结束（current_chair == INVALID_CHAIR）
-		if curChair == HOOK_INVALID_CHAIR then
-			return true
-		end
+		local baoFlag   = fields.bao_flag
+		if lastChair == myChair and baoFlag == 1 then state.baoHuSelf = true end
+		if curChair == myChair then return true end                       -- case_c
+		if curChair == HOOK_INVALID_CHAIR then return true end            -- case_b/d/e
 		return false
 
 	elseif sub == 102 then  -- SEND_CARD (摸牌)
 		if not state.gameStarted then return false end
 		if fields.current_chair ~= myChair then return false end
-		-- case_f: 摸牌轮到我
-		-- 已报胡时：报胡后出牌由系统托管，只有可胡/可杠时才生成决策样本
+		-- case_f: 已报胡时仅可胡/可杠才生成样本
 		if state.baoHuSelf then
 			local mask = tonumber(fields.action_mask) or 0
-			if bit and bit._and and bit:_and(mask, HOOK_HU_GANG_MASK) ~= 0 then
-				return true
-			end
+			if bit and bit._and and bit:_and(mask, HOOK_HU_GANG_MASK) ~= 0 then return true end
 			return false
 		end
 		return true
 
 	elseif sub == 104 then  -- OPERATE_NOTIFY
 		if not state.gameStarted then return false end
-		-- case_g: 操作提示（杠/碰/胡/请胡）轮到我
-		if fields.resume_chair == myChair then
-			return true
+		-- case_g: 操作提示轮到我
+		return fields.resume_chair == myChair
+
+	elseif sub == 105 then  -- OPERATE_RESULT (碰/杠后出牌决策)
+		if not state.gameStarted then return false end
+		-- 碰/杠完，操作者需要出牌：operate_chair 是我时转发
+		-- （杠后会有 SEND_CARD 走 case_f；碰后无摸牌，靠这里触发出牌决策）
+		if fields.operate_chair == myChair then
+			local code = tonumber(fields.code) or 0
+			-- 碰或杠（含加杠）才需要出牌；胡不吃牌不用出牌
+			if bit and bit._and and bit:_and(code, HOOK_WIK_PENG + 0x04 + 0x08) ~= 0 then
+				return true
+			end
 		end
 		return false
 	end
 	return false
 end
 
--- 从 gameEngine._actionList 最后一项提取指令字段（按 sub 类型）
-function ClientScene:_extractInstrFields(sub, gameEngine)
-	local a = gameEngine._actionList and gameEngine._actionList[#gameEngine._actionList]
-	if not a then return nil end
-	if sub == 100 then  -- GAME_START
+-- 从 action 直接提取指令字段（按 sub 类型）
+function ClientScene:_actionToFields(sub, a, gameEngine)
+	if sub == 100 then
 		return {
 			sice_count    = a.lSiceCount,
 			banker_chair  = a.wBankerUser,
@@ -1455,19 +1455,19 @@ function ClientScene:_extractInstrFields(sub, gameEngine)
 			hand_cards    = a.cbCardData,
 			my_chair      = gameEngine.getMeChairID and gameEngine:getMeChairID() or 0,
 		}
-	elseif sub == 101 then  -- OUT_CARD
+	elseif sub == 101 then
 		return { trustee = a.bTrusteeOut, out_chair = a.wOutCardUser, card = a.cbOutCardData }
-	elseif sub == 102 then  -- SEND_CARD
+	elseif sub == 102 then
 		return { card = a.cbCardData, action_mask = a.cbActionMask, current_chair = a.wCurrentUser, tail = a.bTail }
-	elseif sub == 104 then  -- OPERATE_NOTIFY
+	elseif sub == 104 then
 		return { resume_chair = a.wResumeUser, action_mask = a.cbActionMask, action_card = a.cbActionCard }
-	elseif sub == 105 then  -- OPERATE_RESULT
+	elseif sub == 105 then
 		return { operate_chair = a.wOperateUser, provide_chair = a.wProvideUser, code = a.cbOperateCode, cards = a.cbOperateCard, user_action = a.cbUserAction, exclude_card = a.cbExcludeCard }
-	elseif sub == 107 then  -- CHIHU_RESULT
+	elseif sub == 107 then
 		return { operate_chair = a.wOperateUser, provide_chair = a.wProvideUser, hu_kind = a.wUserHuKind, card = a.cbOperateCard, multi_pao = a.bMultplePao, qing_hu = a.bQingHuFlag, card_count = a.cbCardCount, card_data = a.cbCardData }
-	elseif sub == 108 then  -- GAME_END
+	elseif sub == 108 then
 		return { cell_score = a.lCellScore, provide_user = a.wProvideUser, escape_user = a.wEscapeUser, chi_hu_kind = a.dwChiHuKind, game_score = a.lGameScore, card_count = a.cbCardCount, card_data = a.cbCardData, user_card_type = a.cbUserCardType }
-	elseif sub == 115 then  -- BAO_HU_NOTIFY
+	elseif sub == 115 then
 		return { current_chair = a.wCurrentUser, last_chair = a.wLastUser, bao_flag = a.bBaoHuFlag, card = a.cbCardData }
 	end
 	return nil
