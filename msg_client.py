@@ -30,8 +30,77 @@ import websockets
 # 复用 scyxjy_test 里的 ReplayBuilder / Pkt / _BufW / MAX_COUNT
 sys.path.insert(0, str(Path(__file__).parent))
 from scyxjy_test import ReplayBuilder, _BufW, MAX_COUNT
+from scyxjy import generalChairTrainData, _card_to_idx
+from scyxjy_gen_trainData import (
+    _mask_from_channels,
+    ACTION_DISCARD_BASE, ACTION_BAO_HU, ACTION_PENG, ACTION_GANG,
+    ACTION_JIAGANG, ACTION_HU, ACTION_QINGHU, ACTION_PASS, ACTION_SPACE,
+)
 
 REPLAY_DIR = Path(__file__).parent / "replays"
+
+# SanEngine 懒加载（首次用到时才加载 best.pt，避免启动卡顿）
+_san_engine = None
+
+
+def _get_san_engine():
+    global _san_engine
+    if _san_engine is None:
+        from san_engine import SanEngine
+        _san_engine = SanEngine()  # 默认加载 /Users/kebiaoy/Documents/MjTrainData/checkpoints/best.pt
+    return _san_engine
+
+
+def _idx_to_card(idx: int) -> int:
+    """动作索引 0-18 → 牌字节（与 _card_to_idx 互逆）。"""
+    if 0 <= idx <= 8:
+        return 0x11 + idx          # 万 1-9
+    if 9 <= idx <= 17:
+        return 0x21 + (idx - 9)    # 条 1-9
+    if idx == 18:
+        return 0x35                # 红中
+    return 0
+
+
+def _action_name(action: int) -> str:
+    names = {
+        ACTION_BAO_HU: "报胡", ACTION_PENG: "碰", ACTION_GANG: "杠",
+        ACTION_JIAGANG: "加杠", ACTION_HU: "胡", ACTION_QINGHU: "请胡", ACTION_PASS: "过",
+    }
+    if action < ACTION_BAO_HU:
+        return f"弃牌({_idx_to_card(action):#x})"
+    return names.get(action, f"?{action}")
+
+
+def _infer_action_from_instructions(instructions: list) -> tuple[int, int, str] | None:
+    """
+    用 ReplayBuilder 构建 replay → generalChairTrainData 生成样本 → 取最新样本
+    → SanEngine 推理出动作。
+
+    返回 (action, card_byte, desc) 或 None（无法生成样本）。
+    """
+    replay, _ = build_replay_from_instructions(instructions)
+    # 找 my_chair（sub=100 的 fields 里有）
+    my_chair = 0
+    for inst in instructions:
+        if inst.get("sub") == 100:
+            my_chair = (inst.get("fields") or {}).get("my_chair", 0)
+            break
+    # 生成训练样本（每个决策点一个）
+    samples = generalChairTrainData(replay, my_chair)
+    if not samples:
+        return None
+    sample = samples[-1]                      # 最新决策点
+    obs = sample.channels                     # (220, 19) float32
+    mask = _mask_from_channels(sample.channels)  # (26,) bool
+    if not mask.any():
+        return None
+    engine = _get_san_engine()
+    action, q_values = engine.react(obs, mask)
+    # 弃牌动作 → 带牌字节；其他动作 card=0
+    card = _idx_to_card(action) if action < ACTION_BAO_HU else 0
+    desc = _action_name(action)
+    return action, card, desc
 
 
 def _build_chihu_payload(fields: dict) -> bytes:
@@ -289,6 +358,26 @@ class MsgClientApp:
                             self._append_msg(
                                 f"[replay] 来自 {msg.get('from')}，{len(instructions)} 条指令，"
                                 f"{pkt_count} 个包（等待 gameEnd）", "system")
+                        # 非结束局：推理动作并回发给游戏客户端
+                        if not has_end:
+                            try:
+                                result = _infer_action_from_instructions(instructions)
+                            except Exception as ex:
+                                result = None
+                                self._append_msg(f"[infer] 推理失败: {ex}", "error")
+                            if result is not None:
+                                action, card, desc = result
+                                sender = msg.get("from")
+                                action_msg = {"type": "action", "action": action, "card": card, "desc": desc}
+                                # 通过 msg_server 点对点发回给游戏客户端
+                                if self.connected and self.loop is not None:
+                                    asyncio.run_coroutine_threadsafe(
+                                        self._send({"type": "send", "to": sender,
+                                                     "content": json.dumps(action_msg, ensure_ascii=False)}),
+                                        self.loop,
+                                    )
+                                self._append_msg(
+                                    f"[infer] → {sender} 动作={action}({desc}) card={card:#x}", "system")
                         replay_built = True
                 except (json.JSONDecodeError, ValueError):
                     pass

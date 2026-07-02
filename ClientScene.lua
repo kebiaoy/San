@@ -1097,6 +1097,12 @@ function ClientScene:_setupMsgClientListener(client)
 			showToast(this, "已停止自动进房间", 2)
 			return
 		end
+		-- 命令6：action 动作（ControlApp 推理结果，JSON 格式）
+		local ok, actionMsg = pcall(cjson.decode, content)
+		if ok and type(actionMsg) == "table" and actionMsg.type == "action" then
+			this:_executeGameAction(actionMsg.action, actionMsg.card)
+			return
+		end
 		-- 其他消息：正常显示
 		local text
 		if msg.type == "broadcast" then
@@ -1344,6 +1350,48 @@ local HOOK_NKIND_TO_SUB = {
 	[13] = 107,  -- AK_CH_Result
 	[14] = 108,  -- AK_GameEnd
 }
+
+-- action 索引 19-25 → WIK 操作码（与 CMD_Game.lua WIK_* 对齐）
+local HOOK_ACTION_TO_WIK = {
+	[19] = 0x10,  -- 报胡 WIK_BAO_HU
+	[20] = 0x02,  -- 碰   WIK_PENG
+	[21] = 0x04,  -- 杠   WIK_GANG
+	[22] = 0x08,  -- 加杠 WIK_JIA_GANG
+	[23] = 0x40,  -- 胡   WIK_CHI_HU
+	[24] = 0x20,  -- 请胡 WIK_QING_HU
+	[25] = 0x00,  -- 过   WIK_NULL
+}
+
+-- hook：执行 ControlApp 推理出的游戏动作
+--   action 0-18: 弃牌（card 为牌字节）
+--   action 19-25: 报胡/碰/杠/加杠/胡/请胡/过（调 onUserAction + WIK 码）
+function ClientScene:_executeGameAction(action, card)
+	if self:getCurSceneTag() ~= df.SCENE_GAME then
+		showToast(self, "不在游戏中，无法执行 AI 动作", 2)
+		return
+	end
+	local ge = self:getCurScene()
+	if not ge then return end
+
+	if action == nil then return end
+	action = tonumber(action)
+
+	if action < 19 then
+		-- 弃牌：调 onOutCard(card, pos, special)
+		if ge.onOutCard then
+			ge:onOutCard(tonumber(card) or 0, 0, nil)
+			showToast(self, "AI 出牌 "..string.format("%#x", tonumber(card) or 0), 2)
+		end
+	else
+		-- 碰/杠/胡/请胡/报胡/过：调 onUserAction(WIK 码)
+		local wikCode = HOOK_ACTION_TO_WIK[action]
+		if wikCode and ge.onUserAction then
+			ge:onUserAction(wikCode)
+			local names = {[19]="报胡",[20]="碰",[21]="杠",[22]="加杠",[23]="胡",[24]="请胡",[25]="过"}
+			showToast(self, "AI "..(names[action] or tostring(action)), 2)
+		end
+	end
+end
 
 function ClientScene:_hookGameEngineForInstructions(gameEngine)
 	if gameEngine == nil or gameEngine._hookInstrWrapped then return end
