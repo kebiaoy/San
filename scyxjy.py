@@ -1713,8 +1713,8 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
         # ── Ch 209: 可以报胡 ──────────────────────────────────────
         if bao_hu_dec or (action_mask & _WIK_BAO_HU):
             chs[209, :] = 1.0
-        # ── Ch 210: 可以过（有其他操作选项时均可放弃）────────────
-        if bao_hu_dec or trigger_card or (action_mask & (_WIK_PENG | _WIK_GANG | _WIK_JIA_GANG | 0x40 | 0x80)):
+        # ── Ch 210: 可以过（有其他操作选项时均可放弃，自己弃牌阶段不允许过，要么决策，要么弃牌）────────────
+        if not is_discard and (bao_hu_dec or trigger_card or (action_mask & (_WIK_PENG | _WIK_GANG | _WIK_JIA_GANG | 0x40 | 0x80))):
             chs[210, :] = 1.0
 
         # ── Ch 211: 自己已报胡 ────────────────────────────────────
@@ -1848,7 +1848,7 @@ def generalChairTrainData(replayData: VideoReplay, chairId: int) -> list[TrainSa
                     hand.append(card)
                 # ── Case f: 摸牌 ─────────────────────────────────────
                 # 报胡后出牌由系统托管：只有可胡或可杠时才生成决策样本
-                _HU_GANG_MASK = 0x04 | 0x08 | 0x40 | 0x80
+                _HU_GANG_MASK = 0x04 | 0x08 | 0x20 | 0x40 | 0x80
                 if bao_hu_flags.get(chairId, False):
                     if act_mask_b & _HU_GANG_MASK:
                         samples.append(snap(
@@ -2198,11 +2198,11 @@ if __name__ == "__main__":
    # findBaoHuReplays("/Users/kebiaoy/Documents/MjTrainData")
     #findSpecialGangReplays("/Users/kebiaoy/Documents/MjTrainData")
     # 报胡回放
-    # file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
-    file_path = "E:\Train\\61464_20260629\\09856202606290008202.video"
+    file_path="/Users/kebiaoy/Documents/MjTrainData/61263_20260618/09856202606188205401.video"
+    # file_path = "E:\Train\\61464_20260629\\09856202606290008202.video"
     testParseVideoReplay(file_path)
-    replay = parseVideoReplay(file_path)
-    print(_extract_reward(replay,0))
+    #replay = parseVideoReplay(file_path)
+    #print(_extract_reward(replay,0))
     # 检测活跃茶馆
     # checkActiveTea(61000,600,1000)
     #downloadTeaReplay(61464)

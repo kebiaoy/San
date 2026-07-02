@@ -1330,7 +1330,7 @@ end
 --   1. 每条 action 被处理完移除时，按 nKind 映射 sub，提取字段存入 _hookInstructions
 --   2. 参照 scyxjy.py 的 generalChairTrainData 判断 + 碰/杠后出牌决策，在决策点整套转发给 ControlApp
 local HOOK_INVALID_CHAIR = 0xFFFF
-local HOOK_HU_GANG_MASK  = 0x04 + 0x08 + 0x40 + 0x80  -- 杠|加杠|吃胡|点炮
+local HOOK_HU_GANG_MASK  = 0x04 + 0x08 + 0x20 + 0x40 + 0x80  -- 杠|加杠|吃胡|点炮
 local HOOK_WIK_PENG       = 0x02
 
 -- nKind → sub 映射（GameClientEngine.AK_* 常量）
