@@ -1382,12 +1382,14 @@ function ClientScene:_executeGameAction(action, card)
 			ge:onOutCard(tonumber(card) or 0, 0, nil)
 			showToast(self, "AI 出牌 "..string.format("%#x", tonumber(card) or 0), 2)
 		end
-	elseif action == 19 then
-		-- 报胡：点报胡按钮 → 检查是否弹选牌窗 → 弹了就选 AI 指定的牌
+	elseif action == 19 or action == 24 then
+		-- 报胡/请胡：点按钮 → 检查是否弹选牌窗 → 弹了就选 AI 指定的牌
+		local wikCode = HOOK_ACTION_TO_WIK[action]  -- 19→0x10 BAO_HU, 24→0x20 QING_HU
+		local label = (action == 19) and "报胡" or "请胡"
 		if ge.onUserAction then
-			ge:onUserAction(0x10)  -- WIK_BAO_HU → onBaoHuAction(true)
+			ge:onUserAction(wikCode)
 		end
-		-- onBaoHuAction 在多张可报胡牌时会弹 OpSelectView 并 return
+		-- 多张候选牌时会弹 OpSelectView 并 return
 		local opSelect = ge.m_GameView and ge.m_GameView.m_OpSelectView
 		if opSelect and opSelect:isVisible() and opSelect.m_SelectCardInfo then
 			local targetCard = tonumber(card) or 0
@@ -1403,11 +1405,11 @@ function ClientScene:_executeGameAction(action, card)
 			end
 			if selected and ge.onOperateSelected then
 				ge:onOperateSelected(selected)
-				showToast(self, "AI 报胡 "..string.format("%#x", targetCard), 2)
+				showToast(self, "AI "..label.." "..string.format("%#x", targetCard), 2)
 			end
 		else
-			-- 没弹窗（单张牌或非庄家），onBaoHuAction 已直接发命令
-			showToast(self, "AI 报胡", 2)
+			-- 没弹窗（单张牌或非庄家），onUserAction 已直接发命令
+			showToast(self, "AI "..label, 2)
 		end
 	else
 		-- 碰/杠/胡/请胡/报胡/过：调 onUserAction(WIK 码)

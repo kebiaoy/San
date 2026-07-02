@@ -418,9 +418,11 @@ class MsgClientApp:
                             if result is not None:
                                 action, card, desc = result
                                 sender = msg.get("from")
-                                # 报胡特殊处理：伪造 BAO_HU_NOTIFY 重新推理弃牌，
-                                # 报胡+弃牌合并到一条消息（card 字段=弃的牌）
-                                if action == ACTION_BAO_HU:
+                                # 报胡/请胡特殊处理：伪造 BAO_HU_NOTIFY 重新推理弃牌，
+                                # 两者弃牌都只能弃听牌（Ch202 收窄为 Ch203）
+                                # 动作+弃牌合并到一条消息（card 字段=弃的牌）
+                                if action in (ACTION_BAO_HU, ACTION_QINGHU):
+                                    label = "报胡" if action == ACTION_BAO_HU else "请胡"
                                     my_chair = 0
                                     for inst in instructions:
                                         if inst.get("sub") == 100:
@@ -430,11 +432,11 @@ class MsgClientApp:
                                         discard_result = _infer_bao_hu_discard(instructions, my_chair)
                                     except Exception as ex:
                                         discard_result = None
-                                        self._append_msg(f"[infer] 报胡弃牌推理失败: {ex}", "error")
+                                        self._append_msg(f"[infer] {label}弃牌推理失败: {ex}", "error")
                                     if discard_result is not None:
                                         _, card2, desc2 = discard_result
                                         merged = {"type": "action", "action": action,
-                                                  "card": card2, "desc": f"报胡+弃牌({desc2})"}
+                                                  "card": card2, "desc": f"{label}+弃牌({desc2})"}
                                         if self.connected and self.loop is not None:
                                             asyncio.run_coroutine_threadsafe(
                                                 self._send({"type": "send", "to": sender,
@@ -442,9 +444,9 @@ class MsgClientApp:
                                                 self.loop,
                                             )
                                         self._append_msg(
-                                            f"[infer] → {sender} 报胡+弃牌({desc2} card={card2:#x})", "system")
+                                            f"[infer] → {sender} {label}+弃牌({desc2} card={card2:#x})", "system")
                                     else:
-                                        # 弃牌推理失败，单发报胡（card=0）
+                                        # 弃牌推理失败，单发（card=0）
                                         action_msg = {"type": "action", "action": action, "card": 0, "desc": desc}
                                         if self.connected and self.loop is not None:
                                             asyncio.run_coroutine_threadsafe(
