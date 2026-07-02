@@ -103,6 +103,44 @@ def _infer_action_from_instructions(instructions: list) -> tuple[int, int, str] 
     return action, card, desc
 
 
+def _infer_bao_hu_discard(instructions: list, my_chair: int) -> tuple[int, int, str] | None:
+    """
+    AI 报胡后，伪造一个 BAO_HU_NOTIFY（current_chair=INVALID, last_chair=my_chair, bao_flag=1）
+    加入指令列表，重新构建 replay → generalChairTrainData 生成弃牌样本（is_discard=True,
+    bao_hu_flags[my_chair]=True → Ch202 收窄为听牌牌）→ SanEngine 推理弃哪张牌。
+
+    返回 (action, card_byte, desc) 或 None。
+    """
+    # 1. 复制指令列表，追加伪造的 BAO_HU_NOTIFY
+    forged = list(instructions)
+    forged.append({
+        "sub": 115,
+        "fields": {
+            "current_chair": 0xFFFF,   # 报胡阶段全部结束 → 触发 case_b/d/e
+            "last_chair":    my_chair,  # 我报胡了 → bao_hu_flags[my_chair]=True
+            "bao_flag":      1,
+            "card":          0,
+        },
+    })
+    # 2. 重新构建 replay + 生成样本
+    replay, _ = build_replay_from_instructions(forged)
+    samples = generalChairTrainData(replay, my_chair)
+    if not samples:
+        return None
+    sample = samples[-1]
+    obs = sample.channels
+    mask = _mask_from_channels(sample.channels)
+    if not mask.any():
+        return None
+    engine = _get_san_engine()
+    action, _ = engine.react(obs, mask)
+    # 报胡后弃牌阶段只应出弃牌动作（0-18）；若 AI 输出其他动作，放弃
+    if action >= ACTION_BAO_HU:
+        return None
+    card = _idx_to_card(action)
+    return action, card, _action_name(action)
+
+
 def _build_chihu_payload(fields: dict) -> bytes:
     """sub=107 (CHIHU_RESULT) payload，参考 scyxjy.py:_parse_hzdgk_chihu_result 逆操作。"""
     b = _BufW()
@@ -127,9 +165,23 @@ def build_replay_from_instructions(instructions: list, n: int = 2):
         f = inst.get("fields") or {}
         if sub == 100:
             my_chair = f.get("my_chair", 0)
+            banker_chair = f.get("banker_chair", 0)
+            # 我的真实手牌（过滤无效牌）
+            my_hand = [c for c in (f.get("hand_cards") or []) if c not in (0x00, 0xFF)]
+            my_count = len(my_hand)
+            hands = {my_chair: my_hand}
+            # 对家手牌：庄家比非庄家多 1 张，用占位牌填充（值不重要，只影响 hand_counts 计数）
+            for chair in range(n):
+                if chair == my_chair:
+                    continue
+                if my_chair == banker_chair:
+                    opp_count = my_count - 1       # 我是庄家，对家少 1 张
+                else:
+                    opp_count = my_count + 1       # 对家是庄家，多 1 张
+                hands[chair] = [0x01] * max(0, opp_count)
             builder.game_starts(
-                banker=f.get("banker_chair", 0),
-                hands={my_chair: f.get("hand_cards") or []},
+                banker=banker_chair,
+                hands=hands,
                 bao_chair=f.get("bao_chair", 0xFFFF),
                 magic_card=f.get("magic_card", 0x35),
             )
@@ -345,6 +397,9 @@ class MsgClientApp:
                         instructions = inner.get("data") or []
                         replay, pkt_count = build_replay_from_instructions(instructions)
                         has_end = any(i.get("sub") == 108 for i in instructions)
+                        self._append_msg(
+                            f"{content}", "system")
+
                         # 含 gameEnd 的整套：保存到文件
                         if has_end:
                             REPLAY_DIR.mkdir(parents=True, exist_ok=True)
@@ -352,12 +407,7 @@ class MsgClientApp:
                             with open(fname, "wb") as fp:
                                 pickle.dump(replay, fp)
                             self._append_msg(
-                                f"[replay] 来自 {msg.get('from')}，{len(instructions)} 条指令，"
-                                f"{pkt_count} 个包，含 gameEnd → 已保存 {fname.name}", "system")
-                        else:
-                            self._append_msg(
-                                f"[replay] 来自 {msg.get('from')}，{len(instructions)} 条指令，"
-                                f"{pkt_count} 个包（等待 gameEnd）", "system")
+                                f"[replay] 来自 {msg.get('from')}，含 gameEnd → 已保存 {fname.name}", "system")
                         # 非结束局：推理动作并回发给游戏客户端
                         if not has_end:
                             try:
@@ -368,16 +418,52 @@ class MsgClientApp:
                             if result is not None:
                                 action, card, desc = result
                                 sender = msg.get("from")
-                                action_msg = {"type": "action", "action": action, "card": card, "desc": desc}
-                                # 通过 msg_server 点对点发回给游戏客户端
-                                if self.connected and self.loop is not None:
-                                    asyncio.run_coroutine_threadsafe(
-                                        self._send({"type": "send", "to": sender,
-                                                     "content": json.dumps(action_msg, ensure_ascii=False)}),
-                                        self.loop,
-                                    )
-                                self._append_msg(
-                                    f"[infer] → {sender} 动作={action}({desc}) card={card:#x}", "system")
+                                # 报胡特殊处理：伪造 BAO_HU_NOTIFY 重新推理弃牌，
+                                # 报胡+弃牌合并到一条消息（card 字段=弃的牌）
+                                if action == ACTION_BAO_HU:
+                                    my_chair = 0
+                                    for inst in instructions:
+                                        if inst.get("sub") == 100:
+                                            my_chair = (inst.get("fields") or {}).get("my_chair", 0)
+                                            break
+                                    try:
+                                        discard_result = _infer_bao_hu_discard(instructions, my_chair)
+                                    except Exception as ex:
+                                        discard_result = None
+                                        self._append_msg(f"[infer] 报胡弃牌推理失败: {ex}", "error")
+                                    if discard_result is not None:
+                                        _, card2, desc2 = discard_result
+                                        merged = {"type": "action", "action": action,
+                                                  "card": card2, "desc": f"报胡+弃牌({desc2})"}
+                                        if self.connected and self.loop is not None:
+                                            asyncio.run_coroutine_threadsafe(
+                                                self._send({"type": "send", "to": sender,
+                                                             "content": json.dumps(merged, ensure_ascii=False)}),
+                                                self.loop,
+                                            )
+                                        self._append_msg(
+                                            f"[infer] → {sender} 报胡+弃牌({desc2} card={card2:#x})", "system")
+                                    else:
+                                        # 弃牌推理失败，单发报胡（card=0）
+                                        action_msg = {"type": "action", "action": action, "card": 0, "desc": desc}
+                                        if self.connected and self.loop is not None:
+                                            asyncio.run_coroutine_threadsafe(
+                                                self._send({"type": "send", "to": sender,
+                                                             "content": json.dumps(action_msg, ensure_ascii=False)}),
+                                                self.loop,
+                                            )
+                                        self._append_msg(f"[infer] → {sender} 动作={action}({desc})", "system")
+                                else:
+                                    # 普通单动作
+                                    action_msg = {"type": "action", "action": action, "card": card, "desc": desc}
+                                    if self.connected and self.loop is not None:
+                                        asyncio.run_coroutine_threadsafe(
+                                            self._send({"type": "send", "to": sender,
+                                                         "content": json.dumps(action_msg, ensure_ascii=False)}),
+                                            self.loop,
+                                        )
+                                    self._append_msg(
+                                        f"[infer] → {sender} 动作={action}({desc}) card={card:#x}", "system")
                         replay_built = True
                 except (json.JSONDecodeError, ValueError):
                     pass

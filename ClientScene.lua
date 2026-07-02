@@ -1382,6 +1382,33 @@ function ClientScene:_executeGameAction(action, card)
 			ge:onOutCard(tonumber(card) or 0, 0, nil)
 			showToast(self, "AI 出牌 "..string.format("%#x", tonumber(card) or 0), 2)
 		end
+	elseif action == 19 then
+		-- 报胡：点报胡按钮 → 检查是否弹选牌窗 → 弹了就选 AI 指定的牌
+		if ge.onUserAction then
+			ge:onUserAction(0x10)  -- WIK_BAO_HU → onBaoHuAction(true)
+		end
+		-- onBaoHuAction 在多张可报胡牌时会弹 OpSelectView 并 return
+		local opSelect = ge.m_GameView and ge.m_GameView.m_OpSelectView
+		if opSelect and opSelect:isVisible() and opSelect.m_SelectCardInfo then
+			local targetCard = tonumber(card) or 0
+			local selected = nil
+			for i = 1, #opSelect.m_SelectCardInfo do
+				if opSelect.m_SelectCardInfo[i].cbActionCard == targetCard then
+					selected = opSelect.m_SelectCardInfo[i]
+					break
+				end
+			end
+			if not selected and #opSelect.m_SelectCardInfo > 0 then
+				selected = opSelect.m_SelectCardInfo[1]  -- 兜底选第一张
+			end
+			if selected and ge.onOperateSelected then
+				ge:onOperateSelected(selected)
+				showToast(self, "AI 报胡 "..string.format("%#x", targetCard), 2)
+			end
+		else
+			-- 没弹窗（单张牌或非庄家），onBaoHuAction 已直接发命令
+			showToast(self, "AI 报胡", 2)
+		end
 	else
 		-- 碰/杠/胡/请胡/报胡/过：调 onUserAction(WIK 码)
 		local wikCode = HOOK_ACTION_TO_WIK[action]
@@ -1418,7 +1445,23 @@ function ClientScene:_hookGameEngineForInstructions(gameEngine)
 				if fields then
 					table.insert(gself._hookInstructions, { sub = sub, fields = fields })
 					if this:_shouldForwardForTrain(sub, fields, gself) then
-						this:_forwardInstructionsToControlApp(gself._hookInstructions)
+						if sub == 105 then
+							-- 碰后追加 SEND_CARD(card=0xFF) 触发 case_f 弃牌样本
+							-- card=0xFF 不会加入手牌，sub=105 已更新副露和手牌
+							-- 否则 generalChairTrainData 最后一个样本还是 sub=104 的 case_g（mask 里有碰），AI 会再输出碰
+							local myChair = gself.getMeChairID and gself:getMeChairID() or 0
+							local forwarded = {}
+							for i = 1, #gself._hookInstructions do
+								forwarded[i] = gself._hookInstructions[i]
+							end
+							table.insert(forwarded, {
+								sub = 102,
+								fields = { card = 0xFF, current_chair = myChair, action_mask = 0, tail = 0 },
+							})
+							this:_forwardInstructionsToControlApp(forwarded)
+						else
+							this:_forwardInstructionsToControlApp(gself._hookInstructions)
+						end
 					end
 				end
 				-- sub=108 小局结束：延迟 3 秒自动点"继续"（onStartGame(1)）
@@ -1523,14 +1566,14 @@ function ClientScene:_shouldForwardForTrain(sub, fields, gameEngine)
 		-- case_g: 操作提示轮到我
 		return fields.resume_chair == myChair
 
-	elseif sub == 105 then  -- OPERATE_RESULT (碰/杠后出牌决策)
+	elseif sub == 105 then  -- OPERATE_RESULT
 		if not state.gameStarted then return false end
-		-- 碰/杠完，操作者需要出牌：operate_chair 是我时转发
-		-- （杠后会有 SEND_CARD 走 case_f；碰后无摸牌，靠这里触发出牌决策）
 		if fields.operate_chair == myChair then
 			local code = tonumber(fields.code) or 0
-			-- 碰或杠（含加杠）才需要出牌；胡不吃牌不用出牌
-			if bit and bit._and and bit:_and(code, HOOK_WIK_PENG + 0x04 + 0x08) ~= 0 then
+			-- 只对纯碰转发：碰后无摸牌，需要立即触发出牌决策
+			-- 杠/加杠后有 SEND_CARD（摸牌），由 case_f 处理，这里不转发
+			if bit and bit._and and bit:_and(code, HOOK_WIK_PENG) ~= 0
+			   and bit:_and(code, 0x04 + 0x08) == 0 then
 				return true
 			end
 		end
