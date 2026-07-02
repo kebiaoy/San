@@ -1421,11 +1421,60 @@ function ClientScene:_hookGameEngineForInstructions(gameEngine)
 						this:_forwardInstructionsToControlApp(gself._hookInstructions)
 					end
 				end
+				-- sub=108 小局结束：延迟 3 秒自动点"继续"（onStartGame(1)）
+				--   若 m_BattleResult 已设（大局最后一局），onStartGame(1) 内部会转 showBattleResult
+				if sub == 108 then
+					this:_scheduleAutoContinue(gself)
+				end
 			end
 		end
 		origRemove(gself, bNext)
 	end
+
+	-- 包装 showBattleResult：大局结算弹窗显示后，延迟 3 秒自动点"返回"（onExitGame）
+	local origShowBattle = gameEngine.showBattleResult
+	if type(origShowBattle) == "function" then
+		gameEngine.showBattleResult = function(gself, ...)
+			origShowBattle(gself, ...)
+			this:_scheduleAutoExit(gself)
+		end
+	end
+
 	release_print("[Hook] game engine instruction forward hooked (via removeGameAction)")
+end
+
+-- 小局结束自动继续：延迟 3 秒调 onStartGame(1)（= 准备下一局）
+function ClientScene:_scheduleAutoContinue(gameEngine)
+	if gameEngine._hookAutoContinueScheduled then return end
+	gameEngine._hookAutoContinueScheduled = true
+	local this = self
+	gameEngine:runAction(cc.Sequence:create(
+		cc.DelayTime:create(3.0),
+		cc.CallFunc:create(function()
+			gameEngine._hookAutoContinueScheduled = false
+			if gameEngine.onStartGame then
+				showToast(this, "小局结束，自动继续", 2)
+				gameEngine:onStartGame(1)
+			end
+		end)
+	))
+end
+
+-- 大局结束自动返回：延迟 3 秒调 onExitGame（= 返回茶馆/大厅）
+function ClientScene:_scheduleAutoExit(gameEngine)
+	if gameEngine._hookAutoExitScheduled then return end
+	gameEngine._hookAutoExitScheduled = true
+	local this = self
+	gameEngine:runAction(cc.Sequence:create(
+		cc.DelayTime:create(3.0),
+		cc.CallFunc:create(function()
+			gameEngine._hookAutoExitScheduled = false
+			if gameEngine.onExitGame then
+				showToast(this, "大局结束，自动返回", 2)
+				gameEngine:onExitGame()
+			end
+		end)
+	))
 end
 
 -- 判断是否为决策点（参照 scyxjy.py:generalChairTrainData + 碰/杠后出牌）
