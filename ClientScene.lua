@@ -1271,11 +1271,47 @@ function ClientScene:_hookAutoEnterRoom()
 			if target then
 				showToast(this, "加入红中断勾卡2人桌 房号"..tostring(target.dwMappedNum), 2)
 				teaHouseLayer:onJoinBattle(HONGZHONG_DUANGOUKA_KIND, target.dwMappedNum)
+				-- 加入后自动点击"开始游戏"
+				this:_hookAutoStartGame()
 			else
 				showToast(this, "未找到可加入的2人红中断勾卡桌", 3)
 			end
 		end)
 	))
+end
+
+-- 进入约战桌后自动点击"准备"按钮（m_btStart）：
+--   轮询等游戏场景（SCENE_GAME）就绪且 m_btStart 可见（= 已坐下未准备），再调 gameClientEngine:onStartGame(1)
+--   onStartGame(1) 在约战模式下会调 self:userReady() 发 SUB_GF_USER_READY 命令
+function ClientScene:_hookAutoStartGame()
+	local this = self
+	local scheduler = cc.Director:getInstance():getScheduler()
+	local tryCount = 0
+	local handle
+	handle = scheduler:scheduleScriptFunc(function(_dt)
+		tryCount = tryCount + 1
+		-- 进入游戏场景后再尝试
+		if this:getCurSceneTag() == df.SCENE_GAME then
+			local gameEngine = this:getCurScene()
+			if gameEngine and gameEngine.onStartGame then
+				-- m_btStart 可见 = 当前已坐下(US_SIT)且未准备，正是点击"准备"的时机
+				local btStart = gameEngine.m_GameView and gameEngine.m_GameView.m_btStart
+				if btStart and btStart:isVisible() then
+					scheduler:unscheduleScriptEntry(handle)
+					release_print("[Hook] auto click ready (userReady)")
+					showToast(this, "自动准备", 2)
+					gameEngine:onStartGame(1)
+					return
+				end
+			end
+		end
+		-- 超时 30 秒放弃
+		if tryCount > 300 then
+			scheduler:unscheduleScriptEntry(handle)
+			release_print("[Hook] auto ready timeout")
+			showToast(this, "自动准备超时（游戏未就绪）", 3)
+		end
+	end, 0.1, false)
 end
 
 -- 是否当前正在红中断勾卡房间内
