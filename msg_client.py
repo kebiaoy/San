@@ -15,14 +15,80 @@ msg_client.py — 消息客户端（带 GUI）
 
 import asyncio
 import json
+import pickle
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, scrolledtext, messagebox
 from urllib.parse import urlparse
 
 import websockets
+
+# 复用 scyxjy_test 里的 ReplayBuilder / Pkt / _BufW / MAX_COUNT
+sys.path.insert(0, str(Path(__file__).parent))
+from scyxjy_test import ReplayBuilder, _BufW, MAX_COUNT
+
+REPLAY_DIR = Path(__file__).parent / "replays"
+
+
+def _build_chihu_payload(fields: dict) -> bytes:
+    """sub=107 (CHIHU_RESULT) payload，参考 scyxjy.py:_parse_hzdgk_chihu_result 逆操作。"""
+    b = _BufW()
+    b.u16(fields.get("operate_chair", 0xFFFF))
+    b.u16(fields.get("provide_chair", 0xFFFF))
+    b.u16(fields.get("hu_kind", 0))
+    b.u8(fields.get("card", 0))
+    b.u8(fields.get("multi_pao", 0))
+    b.u8(fields.get("qing_hu", 0))
+    b.u8(fields.get("card_count", 0))
+    cards = fields.get("card_data") or []
+    for i in range(MAX_COUNT):
+        b.u8(cards[i] if i < len(cards) else 0xFF)
+    return b.build()
+
+
+def build_replay_from_instructions(instructions: list, n: int = 2):
+    """把指令列表组装成 VideoReplay。返回 (VideoReplay, 包数)。"""
+    builder = ReplayBuilder(n=n)
+    for inst in instructions:
+        sub = inst.get("sub")
+        f = inst.get("fields") or {}
+        if sub == 100:
+            my_chair = f.get("my_chair", 0)
+            builder.game_starts(
+                banker=f.get("banker_chair", 0),
+                hands={my_chair: f.get("hand_cards") or []},
+                bao_chair=f.get("bao_chair", 0xFFFF),
+                magic_card=f.get("magic_card", 0x35),
+            )
+        elif sub == 101:
+            builder.discard(chair=f.get("out_chair", 0), card=f.get("card", 0))
+        elif sub == 102:
+            builder.send(chair=f.get("current_chair", 0), card=f.get("card", 0),
+                         action_mask=f.get("action_mask", 0))
+        elif sub == 104:
+            builder.operate_notify(resume_chair=f.get("resume_chair", 0xFFFF),
+                                    action_mask=f.get("action_mask", 0),
+                                    action_card=f.get("action_card", 0))
+        elif sub == 105:
+            builder.operate_result(operate_chair=f.get("operate_chair", 0xFFFF),
+                                   provide_chair=f.get("provide_chair", 0xFFFF),
+                                   code=f.get("code", 0),
+                                   cards=f.get("cards") or [0, 0, 0])
+        elif sub == 107:
+            builder.add(107, _build_chihu_payload(f), chair=f.get("operate_chair", 0xFFFF))
+        elif sub == 115:
+            builder.bao_hu(current_chair=f.get("current_chair", 0xFFFF),
+                           last_chair=f.get("last_chair", 0xFFFF),
+                           bao_flag=f.get("bao_flag", 0),
+                           card=f.get("card", 0))
+        # sub=108 (gameEnd) 不入 replay 包序列，仅作为结束信号
+    replay = builder.build()
+    return replay, len(builder._pkts)
+
 
 
 class MsgClientApp:
@@ -200,7 +266,34 @@ class MsgClientApp:
                 self._append_msg(f"[system] {name} 下线", "system")
             self._refresh_listbox()
         elif t == "msg":
-            self._append_msg(f"<{msg.get('from')}> {msg.get('content')}")
+            content = msg.get("content")
+            # 检测游戏指令列表消息（来自 sparrowhzdgk GameClientEngine）
+            replay_built = False
+            if isinstance(content, str):
+                try:
+                    inner = json.loads(content)
+                    if isinstance(inner, dict) and inner.get("type") == "instructions":
+                        instructions = inner.get("data") or []
+                        replay, pkt_count = build_replay_from_instructions(instructions)
+                        has_end = any(i.get("sub") == 108 for i in instructions)
+                        # 含 gameEnd 的整套：保存到文件
+                        if has_end:
+                            REPLAY_DIR.mkdir(parents=True, exist_ok=True)
+                            fname = REPLAY_DIR / f"replay_{int(time.time())}.pkl"
+                            with open(fname, "wb") as fp:
+                                pickle.dump(replay, fp)
+                            self._append_msg(
+                                f"[replay] 来自 {msg.get('from')}，{len(instructions)} 条指令，"
+                                f"{pkt_count} 个包，含 gameEnd → 已保存 {fname.name}", "system")
+                        else:
+                            self._append_msg(
+                                f"[replay] 来自 {msg.get('from')}，{len(instructions)} 条指令，"
+                                f"{pkt_count} 个包（等待 gameEnd）", "system")
+                        replay_built = True
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            if not replay_built:
+                self._append_msg(f"<{msg.get('from')}> {content}")
         elif t == "broadcast":
             self._append_msg(f"[广播 {msg.get('from')}] {msg.get('content')}", "broadcast")
         elif t == "error":

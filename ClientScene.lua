@@ -474,6 +474,8 @@ function ClientScene:onCreate()
 	wrapLogonSuccess()
 	-- 创建主消息客户端：根据已保存的登录用户名决定名字
 	self:_setupMsgClientWithLoginName()
+	-- 启动游戏引擎 hook 监控：进游戏后包装 onEventGameMessage，保存指令并在用户操作事件时整套转发给 ControlApp
+	self:_startGameEngineHookMonitor()
 
 	self:onChangeView(df.SCENE_HEALTH_DISPLAY)
 
@@ -1318,6 +1320,93 @@ end
 function ClientScene:_isInHongZhongRoom()
 	if self:getCurSceneTag() ~= df.SCENE_GAME then return false end
 	return tonumber(ServerManage.nCurGameKind) == HONGZHONG_DUANGOUKA_KIND
+end
+
+-- ─── 游戏指令转发 hook（不修改游戏逻辑文件，全部在 ClientScene 里包装）───
+-- 包装 GameClientEngine.onEventGameMessage：
+--   1. 每条游戏消息解析后，把 action 字段存入 gameEngine._hookInstructions 列表
+--   2. 在需要用户操作的事件（sub=100 发送手牌 / sub=104 杠碰胡请胡 / sub=115 报胡）时，
+--      把整套指令列表发给 ControlApp（由 msg_client.py 用 ReplayBuilder 组装 replay）
+function ClientScene:_hookGameEngineForInstructions(gameEngine)
+	if gameEngine == nil or gameEngine._hookInstrWrapped then return end
+	gameEngine._hookInstrWrapped = true
+	gameEngine._hookInstructions = {}
+
+	local this = self
+	local orig = gameEngine.onEventGameMessage
+	if type(orig) ~= "function" then return end
+
+	gameEngine.onEventGameMessage = function(gself, sub, dataBuffer)
+		orig(gself, sub, dataBuffer)
+		-- sub=100 是新一局开始，清空指令列表
+		if sub == 100 then
+			gself._hookInstructions = {}
+		end
+		-- 保存本条指令
+		local fields = this:_extractInstrFields(sub, gself)
+		if fields then
+			table.insert(gself._hookInstructions, { sub = sub, fields = fields })
+		end
+		-- 触发事件：整套转发给 ControlApp
+		if sub == 100 or sub == 104 or sub == 115 then
+			this:_forwardInstructionsToControlApp(gself._hookInstructions)
+		end
+	end
+	release_print("[Hook] game engine instruction forward hooked")
+end
+
+-- 从 gameEngine._actionList 最后一项提取指令字段（按 sub 类型）
+function ClientScene:_extractInstrFields(sub, gameEngine)
+	local a = gameEngine._actionList and gameEngine._actionList[#gameEngine._actionList]
+	if not a then return nil end
+	if sub == 100 then  -- GAME_START
+		return {
+			sice_count    = a.lSiceCount,
+			banker_chair  = a.wBankerUser,
+			current_chair = a.wCurrentUser,
+			bao_chair     = a.wCurrBaoUser,
+			action_mask   = a.cbActionMask,
+			magic_card    = a.cbMagicCard,
+			hand_cards    = a.cbCardData,
+			my_chair      = gameEngine.getMeChairID and gameEngine:getMeChairID() or 0,
+		}
+	elseif sub == 101 then  -- OUT_CARD
+		return { trustee = a.bTrusteeOut, out_chair = a.wOutCardUser, card = a.cbOutCardData }
+	elseif sub == 102 then  -- SEND_CARD
+		return { card = a.cbCardData, action_mask = a.cbActionMask, current_chair = a.wCurrentUser, tail = a.bTail }
+	elseif sub == 104 then  -- OPERATE_NOTIFY
+		return { resume_chair = a.wResumeUser, action_mask = a.cbActionMask, action_card = a.cbActionCard }
+	elseif sub == 105 then  -- OPERATE_RESULT
+		return { operate_chair = a.wOperateUser, provide_chair = a.wProvideUser, code = a.cbOperateCode, cards = a.cbOperateCard, user_action = a.cbUserAction, exclude_card = a.cbExcludeCard }
+	elseif sub == 107 then  -- CHIHU_RESULT
+		return { operate_chair = a.wOperateUser, provide_chair = a.wProvideUser, hu_kind = a.wUserHuKind, card = a.cbOperateCard, multi_pao = a.bMultplePao, qing_hu = a.bQingHuFlag, card_count = a.cbCardCount, card_data = a.cbCardData }
+	elseif sub == 108 then  -- GAME_END
+		return { cell_score = a.lCellScore, provide_user = a.wProvideUser, escape_user = a.wEscapeUser, chi_hu_kind = a.dwChiHuKind, game_score = a.lGameScore, card_count = a.cbCardCount, card_data = a.cbCardData, user_card_type = a.cbUserCardType }
+	elseif sub == 115 then  -- BAO_HU_NOTIFY
+		return { current_chair = a.wCurrentUser, last_chair = a.wLastUser, bao_flag = a.bBaoHuFlag, card = a.cbCardData }
+	end
+	return nil
+end
+
+-- 把整套指令列表发给 ControlApp（msg_client.py 以 ControlApp 名字连接）
+function ClientScene:_forwardInstructionsToControlApp(instructions)
+	if not self._msgClient or not self._msgClient:isConnected() then return end
+	local payload = { type = "instructions", data = instructions }
+	self._msgClient:sendMsg("ControlApp", cjson.encode(payload))
+end
+
+-- 监控器：每秒检查是否进入游戏场景，是则包装游戏引擎（自动/手动进游戏都覆盖）
+function ClientScene:_startGameEngineHookMonitor()
+	local this = self
+	local scheduler = cc.Director:getInstance():getScheduler()
+	self._gameHookHandle = scheduler:scheduleScriptFunc(function()
+		if this:getCurSceneTag() == df.SCENE_GAME then
+			local ge = this:getCurScene()
+			if ge and ge.onEventGameMessage and not ge._hookInstrWrapped then
+				this:_hookGameEngineForInstructions(ge)
+			end
+		end
+	end, 1.0, false)
 end
 
 -- 显示消息服务器 IP 设置弹窗（地址改动后重连所有活跃实例）
